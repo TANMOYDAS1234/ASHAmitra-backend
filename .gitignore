@@ -1,2 +1,21 @@
 node_modules/
 .env
+*.log
+
+# Local test artifacts — never commit
+gcloud_test.mp3
+prod_test.mp3
+test-tts-output.mp3
+test-voices.js
+voice_samples/
+*.mp3
+
+# Secrets
+*-key.json
+gcp-tts-key.json
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
