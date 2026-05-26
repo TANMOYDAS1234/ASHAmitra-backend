@@ -728,6 +728,29 @@ function ttsToSsml(text) {
     .replace(/,/g, ',<break time="180ms"/>')}</speak>`;
 }
 
+// Shared synth helper — used by both /api/tts (raw MP3) and
+// /api/chat-with-voice (base64 in JSON). Returns a Buffer or throws.
+async function synthesizeTts(text, tone = 'normal') {
+  if (!ttsClient) throw new Error('TTS not configured');
+  const p = TTS_TONE_PROFILES[tone] || TTS_TONE_PROFILES.normal;
+  const response = await ttsClient.text.synthesize({
+    requestBody: {
+      input: { ssml: ttsToSsml(text.trim()) },
+      voice: {
+        languageCode: 'bn-IN',
+        name: process.env.GOOGLE_TTS_VOICE || 'bn-IN-Chirp3-HD-Kore',
+      },
+      audioConfig: {
+        audioEncoding: 'MP3',
+        speakingRate: p.rate,
+        sampleRateHertz: 24000,
+        effectsProfileId: ['handset-class-device'],
+      },
+    },
+  });
+  return Buffer.from(response.data.audioContent, 'base64');
+}
+
 app.post('/api/tts', async (req, res) => {
   try {
     const { text, tone = 'normal' } = req.body;
@@ -738,28 +761,7 @@ app.post('/api/tts', async (req, res) => {
     if (!ttsClient)
       return res.status(503).json({ success: false, message: 'TTS not configured' });
 
-    const p = TTS_TONE_PROFILES[tone] || TTS_TONE_PROFILES.normal;
-
-    const response = await ttsClient.text.synthesize({
-      requestBody: {
-        input: { ssml: ttsToSsml(text.trim()) },
-        voice: {
-          languageCode: 'bn-IN',
-          // Kore = mature authoritative female — senior-nurse / consultant register.
-          // Swap to Leda (soft female) / Aoede (warm female) / Charon (deep male)
-          // via the GOOGLE_TTS_VOICE env var on Render without redeploying code.
-          name: process.env.GOOGLE_TTS_VOICE || 'bn-IN-Chirp3-HD-Kore',
-        },
-        audioConfig: {
-          audioEncoding: 'MP3',
-          speakingRate: p.rate,
-          sampleRateHertz: 24000,
-          effectsProfileId: ['handset-class-device'],
-        },
-      },
-    });
-
-    const audioBytes = Buffer.from(response.data.audioContent, 'base64');
+    const audioBytes = await synthesizeTts(text.trim(), tone);
     res.set('Content-Type', 'audio/mpeg');
     res.set('Content-Length', audioBytes.length);
     res.set('Cache-Control', 'public, max-age=86400');
@@ -811,53 +813,122 @@ function aiCacheKey(prompt) {
     .digest('hex');
 }
 
+// Returns { text, provider, cached } — shared by /api/chat and
+// /api/chat-with-voice so the LLM/cache logic stays in one place.
+async function resolveChatReply(prompt, skipCache) {
+  const key = aiCacheKey(prompt);
+  if (!skipCache) {
+    const hit = await AiCache.findOne({ key });
+    if (hit) {
+      AiCache.updateOne({ _id: hit._id }, { $inc: { hits: 1 }, $set: { lastUsedAt: new Date() } }).catch(() => {});
+      return { text: hit.text, provider: hit.provider, cached: true };
+    }
+  }
+  const groqKey = process.env.GROQ_API_KEY;
+  if (groqKey) {
+    const groqRes = await fetch('https://api.groq.com/openai/v1/chat/completions', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${groqKey}` },
+      body: JSON.stringify({
+        model: 'llama-3.3-70b-versatile',
+        messages: [{ role: 'user', content: prompt }],
+        temperature: 0.2,
+        max_tokens: 800,
+      }),
+    });
+    const groqData = await groqRes.json();
+    if (groqRes.ok) {
+      const text = groqData?.choices?.[0]?.message?.content ?? '';
+      if (text) await saveToAiCache(key, prompt, text, 'groq');
+      return { text, provider: 'groq', cached: false };
+    }
+    console.warn('[Groq] failed:', groqRes.status, groqData?.error?.message);
+  }
+  if (geminiKeys.length === 0) throw new Error('No AI provider configured');
+  const text = await callGemini(prompt);
+  if (text) await saveToAiCache(key, prompt, text, 'gemini');
+  return { text, provider: 'gemini', cached: false };
+}
+
 app.post('/api/chat', async (req, res) => {
   try {
     const { prompt, skipCache } = req.body;
     if (!prompt) return res.status(400).json({ success: false, message: 'prompt required' });
+    const reply = await resolveChatReply(prompt, !!skipCache);
+    res.json({ success: true, ...reply });
+  } catch (err) {
+    res.status(503).json({ success: false, message: err.message });
+  }
+});
 
-    // ── Cache lookup ──────────────────────────────────────────────────────────
-    // Same normalized prompt has been answered before → return instantly,
-    // burn zero LLM quota, and the client caches it locally for offline reuse.
-    const key = aiCacheKey(prompt);
-    if (!skipCache) {
-      const hit = await AiCache.findOne({ key });
-      if (hit) {
-        // Async hit counter update — don't block the response.
-        AiCache.updateOne({ _id: hit._id }, { $inc: { hits: 1 }, $set: { lastUsedAt: new Date() } }).catch(() => {});
-        return res.json({ success: true, text: hit.text, provider: hit.provider, cached: true });
+// ── Combined Chat + Voice (2b) ──────────────────────────────────────────────
+// Returns { text, provider, cached, audio (base64), audioMime, audioTone,
+// spokenText }. One HTTP round-trip instead of two — saves ~200-500ms on
+// Render and is the difference between "text shows up, then voice arrives
+// a beat later" and "both land together" on weak rural signal.
+//
+// Body fields:
+//   prompt       — LLM prompt (required)
+//   skipCache    — bypass AiCache lookup (default false)
+//   tone         — TTS tone (normal, empathy, urgent, emergency, ...)
+//   voiceText    — exact text to speak (skips parsing; client knows best)
+//   voiceField   — JSON field in LLM output to extract & speak (e.g.
+//                  "spoken_response" — used by the triage conversation
+//                  where LLM returns a structured object)
+//
+// Resolution order for what gets spoken:
+//   1. voiceText if provided
+//   2. JSON.parse(text)[voiceField] if voiceField provided
+//   3. text itself
+// If TTS synthesis fails the text response still returns (audio = null)
+// so the worker is never left silent on a flaky network.
+app.post('/api/chat-with-voice', async (req, res) => {
+  try {
+    const { prompt, skipCache, tone = 'normal', voiceText, voiceField } = req.body;
+    if (!prompt) return res.status(400).json({ success: false, message: 'prompt required' });
+
+    const reply = await resolveChatReply(prompt, !!skipCache);
+
+    let spoken = '';
+    if (voiceText && voiceText.trim()) {
+      spoken = voiceText.trim();
+    } else if (voiceField) {
+      // LLM returns a structured JSON object (e.g. {spoken_response, ...}).
+      // Strip ```json fences if present then pull the requested field.
+      const raw = (reply.text || '')
+        .trim()
+        .replace(/^```json\s*/i, '')
+        .replace(/```\s*$/i, '')
+        .trim();
+      try {
+        const parsed = JSON.parse(raw);
+        const v = parsed?.[voiceField];
+        if (typeof v === 'string' && v.trim()) spoken = v.trim();
+      } catch (_) { /* leave spoken empty → no audio, text still returns */ }
+    } else {
+      spoken = (reply.text || '').trim();
+    }
+
+    let audio = null;
+    let audioMime = null;
+    if (ttsClient && spoken && spoken.length > 0 && spoken.length <= 2000) {
+      try {
+        const audioBytes = await synthesizeTts(spoken, tone);
+        audio = audioBytes.toString('base64');
+        audioMime = 'audio/mpeg';
+      } catch (e) {
+        console.warn('[chat-with-voice] TTS failed (text still returned):', e.message);
       }
     }
 
-    // ── Try Groq first ────────────────────────────────────────────────────────
-    const groqKey = process.env.GROQ_API_KEY;
-    if (groqKey) {
-      const groqRes = await fetch('https://api.groq.com/openai/v1/chat/completions', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${groqKey}` },
-        body: JSON.stringify({
-          model: 'llama-3.3-70b-versatile',
-          messages: [{ role: 'user', content: prompt }],
-          temperature: 0.2,
-          max_tokens: 800,
-        }),
-      });
-      const groqData = await groqRes.json();
-      if (groqRes.ok) {
-        const text = groqData?.choices?.[0]?.message?.content ?? '';
-        if (text) await saveToAiCache(key, prompt, text, 'groq');
-        return res.json({ success: true, text, provider: 'groq' });
-      }
-      console.warn('[Groq] failed:', groqRes.status, groqData?.error?.message);
-    }
-
-    // ── Fallback: Gemini with key rotation ───────────────────────────────────
-    if (geminiKeys.length === 0)
-      return res.status(503).json({ success: false, message: 'No AI provider configured' });
-
-    const text = await callGemini(prompt);
-    if (text) await saveToAiCache(key, prompt, text, 'gemini');
-    res.json({ success: true, text, provider: 'gemini' });
+    res.json({
+      success: true,
+      ...reply,
+      audio,
+      audioMime,
+      audioTone: tone,
+      spokenText: spoken || null,
+    });
   } catch (err) {
     res.status(503).json({ success: false, message: err.message });
   }
