@@ -711,7 +711,10 @@ app.post('/api/tts', async (req, res) => {
         input: { ssml: ttsToSsml(text.trim()) },
         voice: {
           languageCode: 'bn-IN',
-          name: process.env.GOOGLE_TTS_VOICE || 'bn-IN-Chirp3-HD-Leda',
+          // Charon = deep, calm male — senior-doctor authority register.
+          // Swap to Leda (soft female) / Kore (mature female) / Orus (warm male)
+          // via the GOOGLE_TTS_VOICE env var on Render without redeploying code.
+          name: process.env.GOOGLE_TTS_VOICE || 'bn-IN-Chirp3-HD-Charon',
         },
         audioConfig: {
           audioEncoding: 'MP3',
