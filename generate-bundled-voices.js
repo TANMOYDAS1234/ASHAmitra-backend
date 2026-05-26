@@ -16,7 +16,7 @@ const crypto = require('crypto');
 
 // Must match the production /api/tts cache-key tag exactly so the client
 // can recognize the bundled file as the same logical entry.
-const VOICE_TAG = 'gcloud:Chirp3-HD-Charon:v1';
+const VOICE_TAG = 'gcloud:Chirp3-HD-Kore:v1';
 
 // Phrases that MUST work even when the user has zero internet on first run.
 // Mix of static phrases + parameterized vital alerts for the most clinically
@@ -202,7 +202,7 @@ const TONE_PROFILES = {
       const resp = await tts.text.synthesize({
         requestBody: {
           input: { ssml: toSsml(text) },
-          voice: { languageCode: 'bn-IN', name: 'bn-IN-Chirp3-HD-Charon' },
+          voice: { languageCode: 'bn-IN', name: 'bn-IN-Chirp3-HD-Kore' },
           audioConfig: {
             audioEncoding: 'MP3',
             speakingRate: p.rate,
