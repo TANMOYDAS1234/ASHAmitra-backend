@@ -147,7 +147,62 @@ function buildVitalAlerts() {
   return out;
 }
 
-const CRITICAL_PHRASES = [...STATIC_PHRASES, ...buildVitalAlerts()];
+// All ~87 questions + actions from triage_cases.json. Bundling these
+// covers the deterministic triage flow for day-1 zero-internet installs.
+// Tone matches what TtsPrewarmService uses at runtime ('question') so the
+// md5 cache key lines up and the runtime hits the bundle on first play.
+function loadTriageJsonPhrases() {
+  try {
+    const raw = fs.readFileSync(
+      path.resolve(__dirname, '..', 'ashamitra', 'assets', 'data', 'triage_cases.json'),
+      'utf-8',
+    );
+    const json = JSON.parse(raw);
+    const out = new Set();
+    function walk(node) {
+      if (Array.isArray(node)) {
+        for (const item of node) walk(item);
+      } else if (node && typeof node === 'object') {
+        for (const [k, v] of Object.entries(node)) {
+          if ((k === 'text' || k === 'action') && typeof v === 'string' && v.trim()) {
+            out.add(v.trim());
+          } else {
+            walk(v);
+          }
+        }
+      }
+    }
+    walk(json);
+    return Array.from(out).map((text) => ({ text, tone: 'question' }));
+  } catch (e) {
+    console.warn('[Bundle] Could not load triage_cases.json:', e.message);
+    return [];
+  }
+}
+
+// The 12 common Gemini-style acknowledgment fillers — must match exactly
+// the strings in TtsPrewarmService._acknowledgments() so cache keys align.
+const ACKNOWLEDGMENT_FILLERS = [
+  'বুঝেছি।',
+  'ভালো খবর।',
+  'ধন্যবাদ।',
+  'আপনি ভালো করেছেন জানিয়েছেন।',
+  'এটা গুরুত্বপূর্ণ।',
+  'চিন্তা করবেন না।',
+  'আরেকটু জানতে চাই।',
+  'একটু অপেক্ষা করুন।',
+  'অনুগ্রহ করে আবার বলুন।',
+  'সব ঠিক হয়ে যাবে।',
+  'নিরাপদ থাকুন।',
+  'আপনার পরিশ্রমের জন্য ধন্যবাদ।',
+].map((text) => ({ text, tone: 'empathy' }));
+
+const CRITICAL_PHRASES = [
+  ...STATIC_PHRASES,
+  ...buildVitalAlerts(),
+  ...loadTriageJsonPhrases(),
+  ...ACKNOWLEDGMENT_FILLERS,
+];
 
 // Match the Flutter client's cache key derivation EXACTLY: md5(text|voice|tone).
 function cacheKey(text, tone) {
