@@ -385,6 +385,40 @@ app.patch('/api/reports/repoint', auth, async (req, res) => {
   }
 });
 
+// Attach a patient to an existing (anonymous) report. Used for the
+// 'urgent triage → fill in patient details later' flow on the worker's
+// Reports tab: an ASHA can run a quick anonymous triage during an
+// emergency, save the result, then later open the report and link it to
+// the actual patient they later identified or registered.
+//
+// Restricted to the calling ASHA's reports (ashaId scoped). Only the
+// patientId, patientName, and patientType fields are updatable here —
+// the triage data itself is immutable per clinical-record principles.
+app.patch('/api/reports/:id/attach-patient', auth, async (req, res) => {
+  try {
+    const { patientId, patientName, patientType } = req.body || {};
+    if (!patientId && !patientName) {
+      return res.status(400).json({
+        success: false,
+        message: 'patientId or patientName required',
+      });
+    }
+    const updates = {};
+    if (patientId   !== undefined) updates.patientId   = patientId;
+    if (patientName !== undefined) updates.patientName = patientName;
+    if (patientType !== undefined) updates.caseType    = patientType;
+    const report = await Report.findOneAndUpdate(
+      { _id: req.params.id, ashaId: req.user.id },
+      updates,
+      { new: true },
+    );
+    if (!report) return res.status(404).json({ success: false, message: 'Report not found' });
+    res.json({ success: true, data: toClient(report) });
+  } catch (err) {
+    res.status(500).json({ success: false, message: err.message });
+  }
+});
+
 app.post('/api/reports', auth, async (req, res) => {
   try {
     const report = await Report.create({ ...req.body, ashaId: req.user.id });
