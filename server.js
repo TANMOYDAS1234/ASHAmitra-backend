@@ -69,6 +69,12 @@ const reportSchema = new mongoose.Schema({
   facilityType:        String,
   recheckAfterHours:   { type: Number, default: 0 },
   transportAction:     String,
+  // ── Soft-delete ────────────────────────────────────────────────────────
+  // Worker-initiated deletes mark `deletedAt` instead of removing the doc.
+  // Clinical records are auditable so admin still sees these via the
+  // /api/admin/reports/deleted endpoint; the worker's /api/reports filters
+  // them out. Undo restores by clearing the field.
+  deletedAt:           { type: Date, default: null, index: true },
 }, { timestamps: true });
 
 // ── Notifications ─────────────────────────────────────────────────────────────
@@ -517,8 +523,44 @@ app.delete('/api/notifications/:id', auth, async (req, res) => {
 
 app.get('/api/reports', auth, async (req, res) => {
   try {
-    const reports = await Report.find({ ashaId: req.user.id }).sort({ createdAt: -1 });
+    const reports = await Report.find({
+      ashaId: req.user.id,
+      $or: [{ deletedAt: null }, { deletedAt: { $exists: false } }],
+    }).sort({ createdAt: -1 });
     res.json({ success: true, data: reports.map(toClient) });
+  } catch (err) {
+    res.status(500).json({ success: false, message: err.message });
+  }
+});
+
+// ── Soft-delete a report (worker-initiated) ─────────────────────────────────
+// Sets deletedAt to now instead of removing the doc — admin can still audit
+// via /api/admin/reports/deleted and the worker can undo within their UI.
+app.delete('/api/reports/:id', auth, async (req, res) => {
+  try {
+    const report = await Report.findOneAndUpdate(
+      { _id: req.params.id, ashaId: req.user.id },
+      { deletedAt: new Date() },
+      { new: true },
+    );
+    if (!report) return res.status(404).json({ success: false, message: 'Report not found' });
+    res.json({ success: true, data: toClient(report) });
+  } catch (err) {
+    res.status(500).json({ success: false, message: err.message });
+  }
+});
+
+// ── Restore a soft-deleted report ───────────────────────────────────────────
+// Powers the "Undo" snackbar after a worker deletes by mistake.
+app.patch('/api/reports/:id/restore', auth, async (req, res) => {
+  try {
+    const report = await Report.findOneAndUpdate(
+      { _id: req.params.id, ashaId: req.user.id },
+      { deletedAt: null },
+      { new: true },
+    );
+    if (!report) return res.status(404).json({ success: false, message: 'Report not found' });
+    res.json({ success: true, data: toClient(report) });
   } catch (err) {
     res.status(500).json({ success: false, message: err.message });
   }
@@ -590,7 +632,11 @@ app.patch('/api/admin/workers/:id/activate', auth, adminOnly, async (req, res) =
 
 app.get('/api/admin/reports', auth, adminOnly, async (req, res) => {
   try {
-    const filter = {};
+    // Soft-deleted reports are hidden from the default admin view but
+    // accessible via /api/admin/reports/deleted for audit purposes.
+    const filter = {
+      $or: [{ deletedAt: null }, { deletedAt: { $exists: false } }],
+    };
     // Band filter
     if (req.query.band) filter.finalBand = req.query.band.toUpperCase();
     // Date filters
@@ -632,6 +678,33 @@ app.get('/api/admin/reports', auth, adminOnly, async (req, res) => {
 
     const reports = await Report.find(filter).sort({ createdAt: -1 });
     res.json({ success: true, data: reports.map(toClient) });
+  } catch (err) {
+    res.status(500).json({ success: false, message: err.message });
+  }
+});
+
+// ── Admin audit: soft-deleted reports ───────────────────────────────────────
+// Lists every report where deletedAt is set, sorted by most-recent deletion.
+// Populated with worker name so admin can see who deleted what. Used by the
+// admin panel's "Deleted reports" view — clinical records must be auditable.
+app.get('/api/admin/reports/deleted', auth, adminOnly, async (req, res) => {
+  try {
+    const reports = await Report.find({ deletedAt: { $ne: null } })
+      .sort({ deletedAt: -1 })
+      .populate('ashaId', 'name district block');
+    res.json({
+      success: true,
+      data: reports.map(r => {
+        const obj = toClient(r);
+        if (r.ashaId && typeof r.ashaId === 'object') {
+          obj.ashaName     = r.ashaId.name;
+          obj.ashaDistrict = r.ashaId.district;
+          obj.ashaBlock    = r.ashaId.block;
+          obj.ashaId       = r.ashaId._id.toString();
+        }
+        return obj;
+      }),
+    });
   } catch (err) {
     res.status(500).json({ success: false, message: err.message });
   }
