@@ -783,22 +783,29 @@ const ttsClient = process.env.GOOGLE_TTS_API_KEY
   : null;
 
 // Chirp3-HD voices do NOT accept `pitch` (Google controls prosody internally).
-// We vary tone purely via speakingRate — empathy slows down, emergency speeds up.
+// Rates are kept close to 1.0 — large swings read as theatrical / robotic;
+// subtle variation (±0.05) reads as natural human cadence.
 const TTS_TONE_PROFILES = {
   normal:    { rate: 1.00 },
-  empathy:   { rate: 0.90 },
-  urgent:    { rate: 1.15 },
-  emergency: { rate: 1.25 },
-  positive:  { rate: 0.96 },
-  question:  { rate: 0.92 },
+  empathy:   { rate: 0.95 },
+  urgent:    { rate: 1.08 },
+  emergency: { rate: 1.15 },
+  positive:  { rate: 0.98 },
+  question:  { rate: 0.96 },
 };
 
+// Richer SSML so short clinical sentences don't sound staccato. The pause
+// after দণ্ড ("।") is the most impactful — Chirp3 otherwise runs sentences
+// together. Pause after comma is short enough not to feel laggy.
 function ttsToSsml(text) {
   const esc = text.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
   return `<speak>${esc
-    .replace(/।/g, '।<break time="350ms"/>')
-    .replace(/\?/g, '?<break time="450ms"/>')
-    .replace(/,/g, ',<break time="180ms"/>')}</speak>`;
+    .replace(/।\s*/g, '।<break time="420ms"/>')
+    .replace(/\?\s*/g, '?<break time="500ms"/>')
+    .replace(/!\s*/g, '!<break time="380ms"/>')
+    .replace(/—/g, '<break time="220ms"/>—<break time="220ms"/>')
+    .replace(/:\s*/g, ':<break time="220ms"/>')
+    .replace(/,\s*/g, ',<break time="160ms"/>')}</speak>`;
 }
 
 // Shared synth helper — used by both /api/tts (raw MP3) and
@@ -811,7 +818,13 @@ async function synthesizeTts(text, tone = 'normal') {
       input: { ssml: ttsToSsml(text.trim()) },
       voice: {
         languageCode: 'bn-IN',
-        name: process.env.GOOGLE_TTS_VOICE || 'bn-IN-Chirp3-HD-Kore',
+        // Aoede = warm female with a more neutral / Indian-leaning timbre
+        // than Kore (which pilot listeners flagged as Bangladeshi-sounding).
+        // Override via GOOGLE_TTS_VOICE env var without redeploying code:
+        //   bn-IN-Chirp3-HD-Leda        (soft, slightly higher pitch)
+        //   bn-IN-Chirp3-HD-Kore        (mature, previously default)
+        //   bn-IN-Wavenet-A             (older, distinctly Indian Bengali)
+        name: process.env.GOOGLE_TTS_VOICE || 'bn-IN-Chirp3-HD-Aoede',
       },
       audioConfig: {
         audioEncoding: 'MP3',
