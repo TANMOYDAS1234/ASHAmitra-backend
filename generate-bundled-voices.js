@@ -16,7 +16,7 @@ const crypto = require('crypto');
 
 // Must match the production /api/tts cache-key tag exactly so the client
 // can recognize the bundled file as the same logical entry.
-const VOICE_TAG = 'gcloud:Chirp3-HD-Kore:v1';
+const VOICE_TAG = 'gcloud:Chirp3-HD-Aoede:v1';
 
 // Phrases that MUST work even when the user has zero internet on first run.
 // Mix of static phrases + parameterized vital alerts for the most clinically
@@ -218,18 +218,23 @@ function cacheKey(text, tone) {
 function toSsml(text) {
   const esc = text.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
   return `<speak>${esc
-    .replace(/।/g, '।<break time="350ms"/>')
-    .replace(/\?/g, '?<break time="450ms"/>')
-    .replace(/,/g, ',<break time="180ms"/>')}</speak>`;
+    .replace(/।\s*/g, '।<break time="420ms"/>')
+    .replace(/\?\s*/g, '?<break time="500ms"/>')
+    .replace(/!\s*/g, '!<break time="380ms"/>')
+    .replace(/—/g, '<break time="220ms"/>—<break time="220ms"/>')
+    .replace(/:\s*/g, ':<break time="220ms"/>')
+    .replace(/,\s*/g, ',<break time="160ms"/>')}</speak>`;
 }
 
+// Must match server.js TTS_TONE_PROFILES exactly — bundled MP3s would otherwise
+// sound slower / faster than what the live /api/tts returns for the same text.
 const TONE_PROFILES = {
   normal:    { rate: 1.00 },
-  empathy:   { rate: 0.90 },
-  urgent:    { rate: 1.15 },
-  emergency: { rate: 1.25 },
-  positive:  { rate: 0.96 },
-  question:  { rate: 0.92 },
+  empathy:   { rate: 0.95 },
+  urgent:    { rate: 1.08 },
+  emergency: { rate: 1.15 },
+  positive:  { rate: 0.98 },
+  question:  { rate: 0.96 },
 };
 
 (async () => {
@@ -257,7 +262,7 @@ const TONE_PROFILES = {
       const resp = await tts.text.synthesize({
         requestBody: {
           input: { ssml: toSsml(text) },
-          voice: { languageCode: 'bn-IN', name: 'bn-IN-Chirp3-HD-Kore' },
+          voice: { languageCode: 'bn-IN', name: 'bn-IN-Chirp3-HD-Aoede' },
           audioConfig: {
             audioEncoding: 'MP3',
             speakingRate: p.rate,
