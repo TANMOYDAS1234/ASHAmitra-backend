@@ -710,6 +710,46 @@ app.get('/api/admin/reports/deleted', auth, adminOnly, async (req, res) => {
   }
 });
 
+// ── Admin: restore a soft-deleted report ────────────────────────────────────
+// Clears deletedAt on any report (regardless of which worker owns it).
+// Distinct from the worker /api/reports/:id/restore route which is
+// ashaId-scoped — admin can restore reports across workers.
+app.patch('/api/admin/reports/:id/restore', auth, adminOnly, async (req, res) => {
+  try {
+    const report = await Report.findByIdAndUpdate(
+      req.params.id,
+      { deletedAt: null },
+      { new: true },
+    );
+    if (!report) return res.status(404).json({ success: false, message: 'Report not found' });
+    res.json({ success: true, data: toClient(report) });
+  } catch (err) {
+    res.status(500).json({ success: false, message: err.message });
+  }
+});
+
+// ── Admin: permanent (hard) delete ───────────────────────────────────────────
+// Truly removes the document from the database. Only allowed on reports
+// that are already soft-deleted (deletedAt is set) — that's the policy
+// "audit first, then erase" so a worker's accidental delete can be
+// permanent only after an admin reviews it.
+app.delete('/api/admin/reports/:id/permanent', auth, adminOnly, async (req, res) => {
+  try {
+    const report = await Report.findById(req.params.id);
+    if (!report) return res.status(404).json({ success: false, message: 'Report not found' });
+    if (!report.deletedAt) {
+      return res.status(400).json({
+        success: false,
+        message: 'Report is not soft-deleted. Soft-delete first, then erase.',
+      });
+    }
+    await Report.findByIdAndDelete(req.params.id);
+    res.json({ success: true });
+  } catch (err) {
+    res.status(500).json({ success: false, message: err.message });
+  }
+});
+
 function escapeRegex(s) {
   return String(s).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 }
