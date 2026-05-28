@@ -783,29 +783,32 @@ const ttsClient = process.env.GOOGLE_TTS_API_KEY
   : null;
 
 // Chirp3-HD voices do NOT accept `pitch` (Google controls prosody internally).
-// Rates are kept close to 1.0 — large swings read as theatrical / robotic;
-// subtle variation (±0.05) reads as natural human cadence.
+// Rates pulled slightly under 1.0 — real West Bengal conversational pace is a
+// touch slower than Aoede's default, and that small drop is what reads as
+// "didi talking" rather than "voice assistant reading".
 const TTS_TONE_PROFILES = {
-  normal:    { rate: 1.00 },
-  empathy:   { rate: 0.95 },
-  urgent:    { rate: 1.08 },
-  emergency: { rate: 1.15 },
-  positive:  { rate: 0.98 },
-  question:  { rate: 0.96 },
+  normal:    { rate: 0.94 },
+  empathy:   { rate: 0.90 },
+  urgent:    { rate: 1.05 },
+  emergency: { rate: 1.12 },
+  positive:  { rate: 0.94 },
+  question:  { rate: 0.92 },
 };
 
-// Richer SSML so short clinical sentences don't sound staccato. The pause
-// after দণ্ড ("।") is the most impactful — Chirp3 otherwise runs sentences
-// together. Pause after comma is short enough not to feel laggy.
+// Richer SSML so short clinical sentences don't sound staccato. The pauses
+// after দণ্ড / ? / ! are the most impactful — Chirp3 otherwise runs sentences
+// together. Slightly longer breaks here feel more like a human pausing to
+// breathe; commas stay short enough not to feel laggy.
 function ttsToSsml(text) {
   const esc = text.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
   return `<speak>${esc
-    .replace(/।\s*/g, '।<break time="420ms"/>')
-    .replace(/\?\s*/g, '?<break time="500ms"/>')
-    .replace(/!\s*/g, '!<break time="380ms"/>')
-    .replace(/—/g, '<break time="220ms"/>—<break time="220ms"/>')
-    .replace(/:\s*/g, ':<break time="220ms"/>')
-    .replace(/,\s*/g, ',<break time="160ms"/>')}</speak>`;
+    .replace(/।\s*/g, '।<break time="500ms"/>')
+    .replace(/\?\s*/g, '?<break time="580ms"/>')
+    .replace(/!\s*/g, '!<break time="450ms"/>')
+    .replace(/—/g, '<break time="260ms"/>—<break time="260ms"/>')
+    .replace(/:\s*/g, ':<break time="260ms"/>')
+    .replace(/,\s*/g, ',<break time="200ms"/>')
+    .replace(/\.\s+(?=[A-Z])/g, '.<break time="450ms"/>')}</speak>`;
 }
 
 // Shared synth helper — used by both /api/tts (raw MP3) and
