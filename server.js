@@ -814,7 +814,7 @@ app.get('/api/admin/workers/:id/profile', auth, adminOnly, async (req, res) => {
   }
 });
 
-// ── TTS Proxy (Google Cloud — Chirp3-HD Bengali Leda voice) ─────────────────
+// ── TTS Proxy (Google Cloud — Bengali Wavenet-A, distinctly Indian) ────────
 // Key stays server-side. Flutter calls this endpoint, never Google directly.
 // Returns raw MP3 bytes so Flutter can play + cache on device.
 const { google: googleApis } = require('googleapis');
