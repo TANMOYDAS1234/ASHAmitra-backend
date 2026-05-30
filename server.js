@@ -902,17 +902,45 @@ app.post('/api/tts', async (req, res) => {
 });
 
 // ── AI Chat Proxy (Groq primary, Gemini key-rotation fallback) ───────────────
-const geminiKeys = [
-  process.env.GEMINI_API_KEY,
-  process.env.GEMINI_API_KEY_2,
-  process.env.GEMINI_API_KEY_3,
-].filter(Boolean);
+// Gemini keys are picked up dynamically from any env var matching
+// /^GEMINI_API_KEY(_\d+)?$/ — so adding more keys for production is a
+// Render env-var change, not a code change. Stack as many as you need:
+//   GEMINI_API_KEY
+//   GEMINI_API_KEY_2
+//   GEMINI_API_KEY_3
+//   ... up to GEMINI_API_KEY_99
+// Each free Google AI Studio account gives 1,500 req/day, so 5 keys =
+// 7,500 req/day combined.
+function loadGeminiKeys() {
+  const keys = [];
+  for (const [name, value] of Object.entries(process.env)) {
+    if (/^GEMINI_API_KEY(_\d+)?$/.test(name) && value && value.trim()) {
+      keys.push(value.trim());
+    }
+  }
+  return keys;
+}
+const geminiKeys = loadGeminiKeys();
+console.log(`[Gemini] loaded ${geminiKeys.length} key(s)`);
 let geminiKeyIndex = 0;
+
+// Tracks which keys are temporarily out of quota so we don't waste
+// requests on them. Resets at midnight UTC when Google's daily counters
+// reset. Each entry: keyIndex → epoch ms when it was marked dead.
+const keyDeadUntil = new Map();
+const ONE_DAY_MS = 24 * 60 * 60 * 1000;
 
 async function callGemini(prompt) {
   const total = geminiKeys.length;
+  if (total === 0) throw new Error('No Gemini keys configured');
+  let lastStatus = 0;
   for (let attempt = 0; attempt < total; attempt++) {
-    const key = geminiKeys[geminiKeyIndex % total];
+    const idx = geminiKeyIndex % total;
+    geminiKeyIndex++;
+    // Skip keys flagged dead within the last 24h.
+    const deadUntil = keyDeadUntil.get(idx);
+    if (deadUntil && Date.now() < deadUntil) continue;
+    const key = geminiKeys[idx];
     const res = await fetch(
       `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash-lite:generateContent?key=${key}`,
       {
@@ -924,13 +952,26 @@ async function callGemini(prompt) {
         }),
       }
     );
-    const data = await res.json();
-    if (res.ok) return data?.candidates?.[0]?.content?.parts?.[0]?.text ?? '';
-    // quota exhausted on this key — rotate to next
-    console.warn(`[Gemini] key ${geminiKeyIndex % total} failed (${res.status}), rotating...`);
-    geminiKeyIndex++;
+    if (res.ok) {
+      const data = await res.json();
+      // Clear any prior dead-mark since the key just worked.
+      keyDeadUntil.delete(idx);
+      return data?.candidates?.[0]?.content?.parts?.[0]?.text ?? '';
+    }
+    lastStatus = res.status;
+    // 429 / 403 = quota — mark this key dead for 24h so we skip it.
+    if (res.status === 429 || res.status === 403) {
+      keyDeadUntil.set(idx, Date.now() + ONE_DAY_MS);
+      console.warn(`[Gemini] key #${idx} quota-exhausted (${res.status}), parked 24h`);
+    } else {
+      console.warn(`[Gemini] key #${idx} failed (${res.status}), rotating`);
+    }
   }
-  throw new Error('All Gemini keys exhausted');
+  // Distinguish "all keys are quota-dead" from generic failures so the
+  // client can show a specific message instead of generic "server slow".
+  const e = new Error('All Gemini keys exhausted');
+  e.code = lastStatus === 429 || lastStatus === 403 ? 'AI_QUOTA' : 'AI_FAIL';
+  throw e;
 }
 
 // Cache key version — bump to invalidate the entire cache (e.g. on model change).
@@ -986,7 +1027,11 @@ app.post('/api/chat', async (req, res) => {
     const reply = await resolveChatReply(prompt, !!skipCache);
     res.json({ success: true, ...reply });
   } catch (err) {
-    res.status(503).json({ success: false, message: err.message });
+    res.status(503).json({
+      success: false,
+      message: err.message,
+      errorCode: err.code || 'SERVER_ERROR',
+    });
   }
 });
 
@@ -1059,7 +1104,11 @@ app.post('/api/chat-with-voice', async (req, res) => {
       spokenText: spoken || null,
     });
   } catch (err) {
-    res.status(503).json({ success: false, message: err.message });
+    res.status(503).json({
+      success: false,
+      message: err.message,
+      errorCode: err.code || 'SERVER_ERROR',
+    });
   }
 });
 
