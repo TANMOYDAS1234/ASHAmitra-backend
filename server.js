@@ -861,13 +861,15 @@ async function synthesizeTts(text, tone = 'normal') {
       input: { ssml: ttsToSsml(text.trim()) },
       voice: {
         languageCode: 'bn-IN',
-        // Aoede = warm female with a more neutral / Indian-leaning timbre
-        // than Kore (which pilot listeners flagged as Bangladeshi-sounding).
-        // Override via GOOGLE_TTS_VOICE env var without redeploying code:
-        //   bn-IN-Chirp3-HD-Leda        (soft, slightly higher pitch)
-        //   bn-IN-Chirp3-HD-Kore        (mature, previously default)
-        //   bn-IN-Wavenet-A             (older, distinctly Indian Bengali)
-        name: process.env.GOOGLE_TTS_VOICE || 'bn-IN-Chirp3-HD-Aoede',
+        // Wavenet-A = distinctly Indian Bengali (West Bengal accent).
+        // Older generation than Chirp3-HD but accent is unambiguous,
+        // which mattered more to pilot listeners than the marginal HD
+        // smoothness gain. Override via GOOGLE_TTS_VOICE env var:
+        //   bn-IN-Chirp3-HD-Aoede   (warm female, newer HD model)
+        //   bn-IN-Chirp3-HD-Kore    (mature, slightly Bangladeshi-lean)
+        //   bn-IN-Chirp3-HD-Leda    (soft, slightly higher pitch)
+        //   bn-IN-Wavenet-B         (male)
+        name: process.env.GOOGLE_TTS_VOICE || 'bn-IN-Wavenet-A',
       },
       audioConfig: {
         audioEncoding: 'MP3',
