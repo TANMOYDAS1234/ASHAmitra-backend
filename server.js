@@ -1143,6 +1143,94 @@ function toClient(doc) {
   return obj;
 }
 
+// ── Google Directions proxy ──────────────────────────────────────────────────
+// The Flutter referral map calls this endpoint to get road-routed
+// directions from the worker to a referral facility. We go through the
+// backend (rather than letting the client call Google directly) for two
+// reasons:
+//   1. The API key stays server-side. Embedding it in the APK would
+//      let anyone with the APK make calls on our billing account.
+//   2. We can swap providers (OSRM, Mapbox, Google) here without
+//      reshipping the app.
+//
+// Falls through with 503 if no GOOGLE_DIRECTIONS_API_KEY is set, so the
+// client knows to use its public-OSRM fallback. We accept the existing
+// GOOGLE_TTS_API_KEY as the default since most setups use one project
+// for the whole Google Cloud surface.
+//
+// Response shape (kept as flat / minimal as possible):
+//   { points: [[lat,lng], ...], distanceM, durationS, durationInTrafficS }
+function _decodeGooglePolyline(encoded) {
+  // Google's encoded-polyline algorithm. Returns an array of [lat,lng]
+  // tuples. Standard implementation — see
+  // https://developers.google.com/maps/documentation/utilities/polylinealgorithm
+  const points = [];
+  let index = 0, lat = 0, lng = 0;
+  while (index < encoded.length) {
+    let b, shift = 0, result = 0;
+    do {
+      b = encoded.charCodeAt(index++) - 63;
+      result |= (b & 0x1f) << shift;
+      shift += 5;
+    } while (b >= 0x20);
+    const dlat = (result & 1) ? ~(result >> 1) : (result >> 1);
+    lat += dlat;
+    shift = 0; result = 0;
+    do {
+      b = encoded.charCodeAt(index++) - 63;
+      result |= (b & 0x1f) << shift;
+      shift += 5;
+    } while (b >= 0x20);
+    const dlng = (result & 1) ? ~(result >> 1) : (result >> 1);
+    lng += dlng;
+    points.push([lat / 1e5, lng / 1e5]);
+  }
+  return points;
+}
+
+app.get('/api/directions', async (req, res) => {
+  const key = process.env.GOOGLE_DIRECTIONS_API_KEY ||
+              process.env.GOOGLE_TTS_API_KEY;
+  if (!key) {
+    return res.status(503).json({ success: false, message: 'directions_not_configured' });
+  }
+  const { olat, olng, dlat, dlng } = req.query;
+  if (!olat || !olng || !dlat || !dlng) {
+    return res.status(400).json({ success: false, message: 'missing_coords' });
+  }
+  try {
+    // departure_time=now requests live-traffic duration on top of the
+    // free duration estimate. Worth doing for emergency referrals
+    // where rush-hour can double the realistic travel time.
+    const url = 'https://maps.googleapis.com/maps/api/directions/json' +
+      `?origin=${encodeURIComponent(olat + ',' + olng)}` +
+      `&destination=${encodeURIComponent(dlat + ',' + dlng)}` +
+      '&mode=driving&departure_time=now' +
+      `&key=${key}`;
+    const resp = await fetch(url);
+    const data = await resp.json();
+    if (data.status !== 'OK' || !Array.isArray(data.routes) || data.routes.length === 0) {
+      return res.status(404).json({ success: false, message: 'no_route', google_status: data.status });
+    }
+    const route = data.routes[0];
+    const leg = route.legs && route.legs[0];
+    if (!leg) {
+      return res.status(404).json({ success: false, message: 'no_leg' });
+    }
+    const points = _decodeGooglePolyline(route.overview_polyline.points);
+    res.json({
+      success: true,
+      points,
+      distanceM: leg.distance && leg.distance.value,
+      durationS: leg.duration && leg.duration.value,
+      durationInTrafficS: leg.duration_in_traffic ? leg.duration_in_traffic.value : (leg.duration && leg.duration.value),
+    });
+  } catch (e) {
+    console.error('[directions]', e.message);
+    res.status(500).json({ success: false, message: e.message });
+  }
+});
+
 // ── Start ─────────────────────────────────────────────────────────────────────
 const PORT = process.env.PORT || 5000;
 app.listen(PORT, () => console.log(`AshaМітра backend running on port ${PORT}`));
