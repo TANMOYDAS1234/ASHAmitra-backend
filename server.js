@@ -838,16 +838,24 @@ const TTS_TONE_PROFILES = {
 // Richer SSML so short clinical sentences don't sound staccato. The pauses
 // after দণ্ড / ? / ! are the most impactful — Chirp3 otherwise runs sentences
 // together. Slightly longer breaks here feel more like a human pausing to
-// breathe; commas stay short enough not to feel laggy.
+// breathe.
+//
+// Commas are STRIPPED from the source text (not just break-tagged) because
+// pilot listeners reported the "didi[, dadu]" pause as the most robotic
+// part of the voice. Chirp3-HD already shapes prosody from sentence
+// structure at clause boundaries — adding even a 200ms comma break makes
+// every clause feel beat-by-beat instead of flowing. Periods, question
+// marks, and the new sentence-break-on-". A" rule still give the engine
+// the breath cues it needs.
 function ttsToSsml(text) {
-  const esc = text.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+  const cleaned = text.replace(/,/g, ' ').replace(/\s+/g, ' ').trim();
+  const esc = cleaned.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
   return `<speak>${esc
     .replace(/।\s*/g, '।<break time="500ms"/>')
     .replace(/\?\s*/g, '?<break time="580ms"/>')
     .replace(/!\s*/g, '!<break time="450ms"/>')
     .replace(/—/g, '<break time="260ms"/>—<break time="260ms"/>')
     .replace(/:\s*/g, ':<break time="260ms"/>')
-    .replace(/,\s*/g, ',<break time="200ms"/>')
     .replace(/\.\s+(?=[A-Z])/g, '.<break time="450ms"/>')}</speak>`;
 }
 
