@@ -1143,6 +1143,74 @@ function toClient(doc) {
   return obj;
 }
 
+// ── Groq Whisper transcription proxy ────────────────────────────────────────
+// The Flutter assistant + triage flows record raw audio (because the
+// Android SpeechRecognizer plugin proved unreliable on Infinix HiOS —
+// an audio session race between turns left the mic stuck) and POST it
+// here as multipart/form-data with field name "audio". We forward the
+// bytes to Groq's whisper-large-v3-turbo, which has excellent Bengali
+// support and consistently returns in ~500 ms - 2 s.
+//
+// Key stays server-side (GROQ_API_KEY) so it never ships in the APK.
+// Falls through with 503 if no key, so the client knows to use its
+// device-STT fallback. Returns plain { success, text } on success.
+//
+// Body parsing:
+//   We can't use express.json() for multipart — instead we accept the
+//   audio as a raw Buffer up to 10 MB (an average ASHA-worker utterance
+//   at 64 kbps Opus is well under 200 KB, 10 MB is generous headroom)
+//   in a separate express.raw() middleware mounted just on this route.
+const audioRawParser = express.raw({
+  type: () => true, // any content-type — client may send audio/m4a, audio/webm, etc.
+  limit: '10mb',
+});
+
+app.post('/api/transcribe', audioRawParser, async (req, res) => {
+  const key = process.env.GROQ_API_KEY;
+  if (!key) {
+    return res.status(503).json({ success: false, message: 'transcribe_not_configured' });
+  }
+  if (!req.body || req.body.length === 0) {
+    return res.status(400).json({ success: false, message: 'no_audio' });
+  }
+  try {
+    const lang = (req.query.lang || 'bn').toString();
+    // Build multipart body manually using Node's built-in FormData (Node 18+).
+    const form = new FormData();
+    // The recording on the client uses Opus in WebM container or AAC
+    // in m4a — either way Groq/Whisper auto-detects. Filename's
+    // extension carries the hint.
+    const ext = (req.query.ext || 'm4a').toString().replace(/[^a-z0-9]/gi, '');
+    const blob = new Blob([req.body], { type: req.headers['content-type'] || 'audio/m4a' });
+    form.append('file', blob, `audio.${ext}`);
+    form.append('model', 'whisper-large-v3-turbo');
+    form.append('language', lang);
+    // response_format=verbose_json would give us per-word timestamps;
+    // for now we just want the text.
+    form.append('response_format', 'text');
+    const resp = await fetch('https://api.groq.com/openai/v1/audio/transcriptions', {
+      method: 'POST',
+      headers: { 'Authorization': `Bearer ${key}` },
+      body: form,
+    });
+    if (!resp.ok) {
+      const errText = await resp.text();
+      console.warn('[transcribe] Groq error:', resp.status, errText);
+      return res.status(502).json({
+        success: false,
+        message: 'groq_failed',
+        status: resp.status,
+        detail: errText.slice(0, 200),
+      });
+    }
+    const text = (await resp.text()).trim();
+    res.json({ success: true, text });
+  } catch (e) {
+    console.error('[transcribe]', e.message);
+    res.status(500).json({ success: false, message: e.message });
+  }
+});
+
 // ── Google Directions proxy ──────────────────────────────────────────────────
 // The Flutter referral map calls this endpoint to get road-routed
 // directions from the worker to a referral facility. We go through the
