@@ -964,16 +964,17 @@ app.post('/api/tts', async (req, res) => {
   }
 });
 
-// ── AI Chat Proxy (Groq primary, Gemini key-rotation fallback) ───────────────
+// ── AI Chat Proxy (Groq primary, Gemini fallback) ────────────────────────────
 // Gemini keys are picked up dynamically from any env var matching
-// /^GEMINI_API_KEY(_\d+)?$/ — so adding more keys for production is a
-// Render env-var change, not a code change. Stack as many as you need:
-//   GEMINI_API_KEY
-//   GEMINI_API_KEY_2
-//   GEMINI_API_KEY_3
-//   ... up to GEMINI_API_KEY_99
-// Each free Google AI Studio account gives 1,500 req/day, so 5 keys =
-// 7,500 req/day combined.
+// /^GEMINI_API_KEY(_\d+)?$/ — adding keys is a Render env-var change, not a
+// code change:
+//   GEMINI_API_KEY        ← set this to the PAID key (no daily cap → reliable)
+//   GEMINI_API_KEY_2/_3…  ← optional extra (free) keys, round-robined in
+// Recommended for production: ONE paid key as GEMINI_API_KEY and no free
+// extras — the paid key has no daily quota, so the fallback never fails on
+// "AI at capacity", and there's nothing to rotate. (Free keys give only
+// 1,500 req/day each, which is why multiple were stacked before.) Groq stays
+// the primary; Gemini is only hit when Groq is unavailable/rate-limited.
 function loadGeminiKeys() {
   const keys = [];
   for (const [name, value] of Object.entries(process.env)) {
@@ -987,25 +988,25 @@ const geminiKeys = loadGeminiKeys();
 console.log(`[Gemini] loaded ${geminiKeys.length} key(s)`);
 let geminiKeyIndex = 0;
 
-// Tracks which keys are temporarily out of quota so we don't waste
-// requests on them. Resets at midnight UTC when Google's daily counters
-// reset. Each entry: keyIndex → epoch ms when it was marked dead.
+// Tracks keys temporarily benched after a 429/403 so we don't keep hammering
+// a rate-limited / quota-dead key. Each entry: keyIndex → epoch ms until
+// which it's benched.
 const keyDeadUntil = new Map();
-const ONE_DAY_MS = 24 * 60 * 60 * 1000;
+// Bench duration after a 429/403. Deliberately SHORT: a transient rate limit
+// (the common case for a single PAID key) recovers in minutes; a genuinely
+// quota-dead free key just re-benches on its next turn — Groq (primary) and
+// the AiCache absorb the occasional retry. Was 24h, which would have
+// disabled a lone paid fallback key for a whole day on one transient 429.
+const KEY_BENCH_MS = 15 * 60 * 1000;
 
 async function callGemini(prompt) {
   const total = geminiKeys.length;
   if (total === 0) throw new Error('No Gemini keys configured');
   let lastStatus = 0;
-  for (let attempt = 0; attempt < total; attempt++) {
-    const idx = geminiKeyIndex % total;
-    geminiKeyIndex++;
-    // Skip keys flagged dead within the last 24h.
-    const deadUntil = keyDeadUntil.get(idx);
-    if (deadUntil && Date.now() < deadUntil) continue;
-    const key = geminiKeys[idx];
+
+  const tryKey = async (idx) => {
     const res = await fetch(
-      `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash-lite:generateContent?key=${key}`,
+      `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash-lite:generateContent?key=${geminiKeys[idx]}`,
       {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -1017,18 +1018,38 @@ async function callGemini(prompt) {
     );
     if (res.ok) {
       const data = await res.json();
-      // Clear any prior dead-mark since the key just worked.
-      keyDeadUntil.delete(idx);
+      keyDeadUntil.delete(idx); // it works → un-bench
       return data?.candidates?.[0]?.content?.parts?.[0]?.text ?? '';
     }
     lastStatus = res.status;
-    // 429 / 403 = quota — mark this key dead for 24h so we skip it.
     if (res.status === 429 || res.status === 403) {
-      keyDeadUntil.set(idx, Date.now() + ONE_DAY_MS);
-      console.warn(`[Gemini] key #${idx} quota-exhausted (${res.status}), parked 24h`);
+      keyDeadUntil.set(idx, Date.now() + KEY_BENCH_MS);
+      console.warn(`[Gemini] key #${idx} rate/quota (${res.status}), benched ${KEY_BENCH_MS / 60000}m`);
     } else {
       console.warn(`[Gemini] key #${idx} failed (${res.status}), rotating`);
     }
+    return null;
+  };
+
+  // Pass 1: round-robin over keys that aren't currently benched.
+  let attempted = false;
+  for (let i = 0; i < total; i++) {
+    const idx = geminiKeyIndex % total;
+    geminiKeyIndex++;
+    const benchedUntil = keyDeadUntil.get(idx);
+    if (benchedUntil && Date.now() < benchedUntil) continue;
+    attempted = true;
+    const text = await tryKey(idx);
+    if (text !== null) return text;
+  }
+  // Pass 2: every key was already benched from earlier calls (we made no
+  // request above) — force one attempt ignoring the bench, so a lone paid
+  // fallback key is never left dark waiting out a stale bench.
+  if (!attempted) {
+    const idx = geminiKeyIndex % total;
+    geminiKeyIndex++;
+    const text = await tryKey(idx);
+    if (text !== null) return text;
   }
   // Distinguish "all keys are quota-dead" from generic failures so the
   // client can show a specific message instead of generic "server slow".
