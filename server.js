@@ -1166,6 +1166,39 @@ Rules:
   }
 });
 
+// Robustly pull the speakable text out of an LLM reply that may be pure JSON,
+// prose-then-JSON, fenced JSON, or plain prose. The old handler did a naive
+// JSON.parse and gave up (→ no audio) the moment Groq added any prose/fence —
+// which is common — dropping the prefetched MP3 and forcing the app onto the
+// slower per-sentence /tts fallback. This mirrors the client's _extractJsonObject
+// and, crucially, ALWAYS returns something speakable so the combined endpoint
+// never comes back silent.
+function extractSpokenText(text, voiceField) {
+  const t = (text || '').trim();
+  if (!t) return '';
+  const s = t.indexOf('{');
+  if (s >= 0) {
+    let depth = 0;
+    for (let i = s; i < t.length; i++) {
+      if (t[i] === '{') depth++;
+      else if (t[i] === '}') {
+        if (--depth === 0) {
+          try {
+            const parsed = JSON.parse(t.slice(s, i + 1));
+            const v = parsed && parsed[voiceField];
+            if (typeof v === 'string' && v.trim()) return v.trim();
+          } catch (_) { /* not valid JSON — fall through to prose */ }
+          // JSON block present but no usable field → speak the prose around it.
+          const prose = (t.slice(0, s) + t.slice(i + 1)).trim();
+          return prose || t;
+        }
+      }
+    }
+  }
+  // No JSON at all → strip a trailing {...} tail (if any) and speak the prose.
+  return t.replace(/\{[\s\S]*\}\s*$/m, '').trim() || t;
+}
+
 // ── Combined Chat + Voice (2b) ──────────────────────────────────────────────
 // Returns { text, provider, cached, audio (base64), audioMime, audioTone,
 // spokenText }. One HTTP round-trip instead of two — saves ~200-500ms on
@@ -1198,18 +1231,9 @@ app.post('/api/chat-with-voice', async (req, res) => {
     if (voiceText && voiceText.trim()) {
       spoken = voiceText.trim();
     } else if (voiceField) {
-      // LLM returns a structured JSON object (e.g. {spoken_response, ...}).
-      // Strip ```json fences if present then pull the requested field.
-      const raw = (reply.text || '')
-        .trim()
-        .replace(/^```json\s*/i, '')
-        .replace(/```\s*$/i, '')
-        .trim();
-      try {
-        const parsed = JSON.parse(raw);
-        const v = parsed?.[voiceField];
-        if (typeof v === 'string' && v.trim()) spoken = v.trim();
-      } catch (_) { /* leave spoken empty → no audio, text still returns */ }
+      // Robust extraction (pure JSON / prose+JSON / fenced / plain prose) —
+      // always yields something speakable so we never return silent audio.
+      spoken = extractSpokenText(reply.text, voiceField);
     } else {
       spoken = (reply.text || '').trim();
     }
