@@ -1045,6 +1045,74 @@ app.post('/api/chat', async (req, res) => {
   }
 });
 
+// ── Case detection (triage situation → case classifier) ──────────────────────
+// Moved server-side so the Gemini key never ships inside the APK. The Flutter
+// client used to call Google directly with a hardcoded key (trivially
+// extractable from the binary); now it POSTs the transcript + the case list
+// and we run the SAME low-temperature classification through the rotating
+// Gemini keys. Rule-based detection still runs client-side first — this
+// endpoint is only hit for the ambiguous-confidence fallback, and the client
+// falls back to its rule result if this call fails, so a 5xx here degrades
+// gracefully and never blocks triage.
+//
+// Body: { transcript: string, cases: [{ id, titleEn }] }
+// Returns: { success, caseId, confidence }
+app.post('/api/detect-case', async (req, res) => {
+  try {
+    const { transcript, cases } = req.body;
+    if (!transcript || !Array.isArray(cases) || cases.length === 0) {
+      return res.status(400).json({ success: false, message: 'transcript and cases[] required' });
+    }
+    const ids = cases.map((c) => c && c.id).filter(Boolean);
+    const caseList = cases
+      .map((c) => `${c.id}: ${c.titleEn || c.title || ''}`)
+      .join('\n');
+    // Prompt kept byte-for-byte equivalent to the old client-side prompt so
+    // classification behaviour is unchanged — only WHERE Gemini is called moved.
+    const prompt = `You are a medical triage classifier for ASHA workers in rural India.
+Given the following speech transcript, classify it into exactly one case type.
+
+Available cases:
+${caseList}
+
+Transcript: "${transcript}"
+
+Respond with ONLY a JSON object like:
+{"caseId": "pregnancy", "confidence": 0.95}
+
+Rules:
+- caseId must be one of: ${ids.join(', ')}
+- confidence must be between 0.0 and 1.0
+- No explanation, no markdown, just the JSON object`;
+
+    const raw = await callGemini(prompt);
+    const cleaned = (raw || '')
+      .trim()
+      .replace(/```json/g, '')
+      .replace(/```/g, '')
+      .trim();
+    let parsed;
+    try {
+      parsed = JSON.parse(cleaned);
+    } catch (_) {
+      return res.status(502).json({ success: false, message: 'AI returned unparseable output' });
+    }
+    const caseId = typeof parsed.caseId === 'string' ? parsed.caseId : null;
+    let confidence = typeof parsed.confidence === 'number' ? parsed.confidence : null;
+    if (!caseId || confidence === null || !ids.includes(caseId)) {
+      return res.status(502).json({ success: false, message: 'AI returned an invalid case' });
+    }
+    confidence = Math.max(0, Math.min(1, confidence)); // clamp to [0,1]
+    res.json({ success: true, caseId, confidence });
+  } catch (err) {
+    res.status(503).json({
+      success: false,
+      message: err.message,
+      errorCode: err.code || 'SERVER_ERROR',
+    });
+  }
+});
+
 // ── Combined Chat + Voice (2b) ──────────────────────────────────────────────
 // Returns { text, provider, cached, audio (base64), audioMime, audioTone,
 // spokenText }. One HTTP round-trip instead of two — saves ~200-500ms on
