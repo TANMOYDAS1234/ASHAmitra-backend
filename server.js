@@ -912,26 +912,31 @@ function ttsToSsml(text) {
     .replace(/\.\s+(?=[A-Z])/g, '.<break time="450ms"/>')}</speak>`;
 }
 
-// Shared synth helper — used by both /api/tts (raw MP3) and
-// /api/chat-with-voice (base64 in JSON). Returns a Buffer or throws.
-async function synthesizeTts(text, tone = 'normal') {
+// Plain-text (no-SSML) variant of the spoken text — normalized pronunciation
+// + comma strip, but no <break> tags. Used for voices that reject SSML.
+function ttsPlainText(text) {
+  return normalizeForSpeech(text).replace(/,/g, ' ').replace(/\s+/g, ' ').trim();
+}
+
+// Shared synth helper — used by /api/tts, /api/chat-with-voice, and the voice
+// preview. [voiceName] overrides the configured voice (for A/B previews and
+// future per-language voices). Returns a Buffer or throws.
+//
+// All voices are bn-IN (India / West Bengal accent). Chirp3-HD voices do NOT
+// accept SSML, so they get normalized PLAIN text (they shape prosody natively);
+// Wavenet/Standard get the richer SSML with breath pauses. This lets us switch
+// the voice freely via GOOGLE_TTS_VOICE without the SSML path breaking HD voices.
+async function synthesizeTts(text, tone = 'normal', voiceName) {
   if (!ttsClient) throw new Error('TTS not configured');
   const p = TTS_TONE_PROFILES[tone] || TTS_TONE_PROFILES.normal;
+  const name = voiceName || process.env.GOOGLE_TTS_VOICE || 'bn-IN-Wavenet-A';
+  const input = /chirp/i.test(name)
+    ? { text: ttsPlainText(text.trim()) }
+    : { ssml: ttsToSsml(text.trim()) };
   const response = await ttsClient.text.synthesize({
     requestBody: {
-      input: { ssml: ttsToSsml(text.trim()) },
-      voice: {
-        languageCode: 'bn-IN',
-        // Wavenet-A = distinctly Indian Bengali (West Bengal accent).
-        // Older generation than Chirp3-HD but accent is unambiguous,
-        // which mattered more to pilot listeners than the marginal HD
-        // smoothness gain. Override via GOOGLE_TTS_VOICE env var:
-        //   bn-IN-Chirp3-HD-Aoede   (warm female, newer HD model)
-        //   bn-IN-Chirp3-HD-Kore    (mature, slightly Bangladeshi-lean)
-        //   bn-IN-Chirp3-HD-Leda    (soft, slightly higher pitch)
-        //   bn-IN-Wavenet-B         (male)
-        name: process.env.GOOGLE_TTS_VOICE || 'bn-IN-Wavenet-A',
-      },
+      input,
+      voice: { languageCode: 'bn-IN', name },
       audioConfig: {
         audioEncoding: 'MP3',
         speakingRate: p.rate,
@@ -961,6 +966,44 @@ app.post('/api/tts', async (req, res) => {
   } catch (err) {
     console.error('[TTS] Google Cloud error:', err.message);
     res.status(502).json({ success: false, message: 'TTS provider error', detail: err.message });
+  }
+});
+
+// ── Voice A/B preview ────────────────────────────────────────────────────────
+// Pick the right Indian-Bengali voice by EAR: open in a phone browser
+//   /api/voice-preview?voice=bn-IN-Wavenet-A
+// and listen. Same sample line each time (it includes "didi", an acronym, a
+// BP reading and a temperature, so tone AND pronunciation are auditioned).
+// All candidates are bn-IN (India / West Bengal); voice is allowlisted so the
+// query param can't be abused. Whichever you pick, set it as GOOGLE_TTS_VOICE.
+const PREVIEW_VOICES = new Set([
+  'bn-IN-Wavenet-A', 'bn-IN-Wavenet-C',          // female, classic
+  'bn-IN-Standard-A', 'bn-IN-Standard-C',        // female, lighter
+  'bn-IN-Chirp3-HD-Aoede', 'bn-IN-Chirp3-HD-Leda', 'bn-IN-Chirp3-HD-Kore', // female, HD
+]);
+const PREVIEW_SAMPLE =
+  'নমস্কার দিদি আমি আশামিত্র। রোগীর BP ১৪০/৯০ আর জ্বর ৩৮.৫°C। এখনই PHC-তে রেফার করুন।';
+
+app.get('/api/voice-preview', async (req, res) => {
+  try {
+    if (!ttsClient)
+      return res.status(503).json({ success: false, message: 'TTS not configured' });
+    const voice = String(req.query.voice || 'bn-IN-Wavenet-A');
+    if (!PREVIEW_VOICES.has(voice))
+      return res.status(400).json({
+        success: false, message: 'unknown voice', allowed: [...PREVIEW_VOICES],
+      });
+    const text = req.query.text
+      ? String(req.query.text).slice(0, 500)
+      : PREVIEW_SAMPLE;
+    const audioBytes = await synthesizeTts(text, 'normal', voice);
+    res.set('Content-Type', 'audio/mpeg');
+    res.set('Content-Length', audioBytes.length);
+    res.set('Cache-Control', 'no-store');
+    res.send(audioBytes);
+  } catch (err) {
+    console.error('[voice-preview] error:', err.message);
+    res.status(502).json({ success: false, message: 'voice failed (may be unavailable)', detail: err.message });
   }
 });
 
