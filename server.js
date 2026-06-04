@@ -835,6 +835,56 @@ const TTS_TONE_PROFILES = {
   question:  { rate: 0.92 },
 };
 
+// ── Pronunciation normalization ──────────────────────────────────────────────
+// The bn-IN voice mispronounces (or spells out wrong) the Latin acronyms,
+// units, and number formats the assistant routinely produces — "BP 150/95",
+// "37.5°C", "ORS", "PHC", "mg/kg". We rewrite those into Bengali script the
+// voice says correctly, BEFORE building SSML, so a worker hears the term the
+// way she'd say it. Runs on every TTS path (/tts + /chat-with-voice) so the
+// fix is universal and the synthesized MP3 cache stores the good version.
+//
+// Matching notes:
+//   - Latin acronyms are matched case-sensitively with \b so we never touch
+//     lowercase substrings inside ordinary words (e.g. "ml" in "calmly").
+//   - Compound units (mg/kg, /day) are handled before the bare-unit rules.
+//   - Longer acronyms are listed before shorter ones to avoid partial hits.
+const TTS_TERM_MAP = [
+  // Compound units first (so the slash rule below doesn't split them)
+  [/\bmg\s*\/\s*kg\b/g, ' মিলিগ্রাম প্রতি কেজি'],
+  [/\b\/\s*day\b/gi, ' প্রতিদিন'],
+  // Facility / programme / clinical acronyms → Bengali letter-sounds
+  [/\bSNCU\b/g, 'এস এন সি ইউ'], [/\bNICU\b/g, 'এন আই সি ইউ'],
+  [/\bHBNC\b/g, 'এইচ বি এন সি'], [/\bVHND\b/g, 'ভি এইচ এন ডি'],
+  [/\bMDSR\b/g, 'এম ডি এস আর'], [/\bJSSK\b/g, 'জে এস এস কে'],
+  [/\bPHC\b/g, 'পি এইচ সি'], [/\bCHC\b/g, 'সি এইচ সি'],
+  [/\bSDH\b/g, 'এস ডি এইচ'], [/\bORS\b/g, 'ও আর এস'],
+  [/\bANC\b/g, 'এ এন সি'], [/\bPNC\b/g, 'পি এন সি'],
+  [/\bANM\b/g, 'এ এন এম'], [/\bOPD\b/g, 'ও পি ডি'],
+  [/\bIPD\b/g, 'আই পি ডি'], [/\bIFA\b/g, 'আই এফ এ'],
+  [/\bIUD\b/g, 'আই ইউ ডি'], [/\bEDD\b/g, 'ই ডি ডি'],
+  [/\bLMP\b/g, 'এল এম পি'], [/\bMCP\b/g, 'এম সি পি'],
+  [/\bJSY\b/g, 'জে এস ওয়াই'], [/\bPPH\b/g, 'পি পি এইচ'],
+  [/\bBP\b/g, 'বি পি'], [/\bTT\b/g, 'টি টি'],
+  [/\bHb\b/g, 'হিমোগ্লোবিন'], [/\bHB\b/g, 'হিমোগ্লোবিন'],
+  // Common English domain words the bn voice garbles
+  [/\bvaccination\b/gi, 'ভ্যাকসিনেশন'], [/\bvaccine\b/gi, 'ভ্যাকসিন'],
+  [/\breferral\b/gi, 'রেফারেল'], [/\brefer\b/gi, 'রেফার'],
+  [/\breport\b/gi, 'রিপোর্ট'], [/\bcheck\s*up\b/gi, 'চেকআপ'],
+  // Units
+  [/°\s*C\b/g, ' ডিগ্রি সেলসিয়াস'], [/°\s*F\b/g, ' ডিগ্রি ফারেনহাইট'],
+  [/\bmg\b/g, ' মিলিগ্রাম'], [/\bml\b/g, ' মিলিলিটার'],
+  [/\bkg\b/g, ' কেজি'], [/%/g, ' শতাংশ'],
+];
+
+function normalizeForSpeech(text) {
+  // "X/Y" between digits (Bengali ০-৯ or Latin 0-9) → "X বাটা Y" so the
+  // voice says "একশো পঞ্চাশ বাটা পঁচানব্বই" for a BP reading instead of
+  // reading the slash literally or dropping it.
+  let t = text.replace(/([0-9০-৯])\s*\/\s*([0-9০-৯])/g, '$1 বাটা $2');
+  for (const [re, sub] of TTS_TERM_MAP) t = t.replace(re, sub);
+  return t.replace(/\s+/g, ' ').trim();
+}
+
 // Richer SSML so short clinical sentences don't sound staccato. The pauses
 // after দণ্ড / ? / ! are the most impactful — Chirp3 otherwise runs sentences
 // together. Slightly longer breaks here feel more like a human pausing to
@@ -848,7 +898,10 @@ const TTS_TONE_PROFILES = {
 // marks, and the new sentence-break-on-". A" rule still give the engine
 // the breath cues it needs.
 function ttsToSsml(text) {
-  const cleaned = text.replace(/,/g, ' ').replace(/\s+/g, ' ').trim();
+  // Pronunciation pass FIRST — turns "BP 150/95" etc. into speakable Bengali
+  // before comma-strip / escaping / break-tagging below.
+  const spoken = normalizeForSpeech(text);
+  const cleaned = spoken.replace(/,/g, ' ').replace(/\s+/g, ' ').trim();
   const esc = cleaned.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
   return `<speak>${esc
     .replace(/।\s*/g, '।<break time="500ms"/>')
