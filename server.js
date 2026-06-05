@@ -155,7 +155,9 @@ function adminOnly(req, res, next) {
 }
 
 // ── Health ───────────────────────────────────────────────────────────────────
-app.get('/health', (_, res) => res.json({ success: true, message: 'AshaMitra backend is running', version: '1.0.0' }));
+// `build` is a deploy marker — bump it when verifying a deploy actually landed
+// on Render (e.g. confirm the spoken_text audio fix is live).
+app.get('/health', (_, res) => res.json({ success: true, message: 'AshaMitra backend is running', version: '1.0.0', build: 'spoken-text-regex' }));
 
 // ── Auth ──────────────────────────────────────────────────────────────────────
 
