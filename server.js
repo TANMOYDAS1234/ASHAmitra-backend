@@ -1049,7 +1049,9 @@ async function callGemini(prompt) {
 
   const tryKey = async (idx) => {
     const res = await fetch(
-      `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash-lite:generateContent?key=${geminiKeys[idx]}`,
+      // gemini-2.5-flash: better quality + reliable on the paid key
+      // (replaced gemini-2.0-flash-lite). Override with GEMINI_MODEL env if needed.
+      `https://generativelanguage.googleapis.com/v1beta/models/${process.env.GEMINI_MODEL || 'gemini-2.5-flash'}:generateContent?key=${geminiKeys[idx]}`,
       {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
