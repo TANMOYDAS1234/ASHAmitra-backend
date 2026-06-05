@@ -157,7 +157,7 @@ function adminOnly(req, res, next) {
 // ── Health ───────────────────────────────────────────────────────────────────
 // `build` is a deploy marker — bump it when verifying a deploy actually landed
 // on Render (e.g. confirm the spoken_text audio fix is live).
-app.get('/health', (_, res) => res.json({ success: true, message: 'AshaMitra backend is running', version: '1.0.0', build: 'spoken-text-regex' }));
+app.get('/health', (_, res) => res.json({ success: true, message: 'AshaMitra backend is running', version: '1.0.0', build: 'gemini-no-think' }));
 
 // ── Auth ──────────────────────────────────────────────────────────────────────
 
@@ -1049,17 +1049,25 @@ async function callGemini(prompt) {
   if (total === 0) throw new Error('No Gemini keys configured');
   let lastStatus = 0;
 
+  // gemini-2.5-flash (override via GEMINI_MODEL). NOTE: 2.5 models enable
+  // "thinking" by default, and those reasoning tokens are drawn from the SAME
+  // maxOutputTokens budget — which was truncating these short replies
+  // mid-sentence (the visible answer ran out of budget after thinking). We
+  // disable thinking (thinkingBudget: 0) for 2.5 models so the full budget
+  // goes to the actual reply, and raise the cap for headroom.
+  const model = process.env.GEMINI_MODEL || 'gemini-2.5-flash';
+  const genConfig = { temperature: 0.2, maxOutputTokens: 1024 };
+  if (/2\.5/.test(model)) genConfig.thinkingConfig = { thinkingBudget: 0 };
+
   const tryKey = async (idx) => {
     const res = await fetch(
-      // gemini-2.5-flash: better quality + reliable on the paid key
-      // (replaced gemini-2.0-flash-lite). Override with GEMINI_MODEL env if needed.
-      `https://generativelanguage.googleapis.com/v1beta/models/${process.env.GEMINI_MODEL || 'gemini-2.5-flash'}:generateContent?key=${geminiKeys[idx]}`,
+      `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${geminiKeys[idx]}`,
       {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           contents: [{ parts: [{ text: prompt }] }],
-          generationConfig: { temperature: 0.2, maxOutputTokens: 800 },
+          generationConfig: genConfig,
         }),
       }
     );
@@ -1245,9 +1253,11 @@ function extractSpokenText(text, voiceField) {
   const t = (text || '').trim();
   if (!t) return '';
   // 1. Direct field extraction — works for valid, fenced, prose-wrapped, AND
-  //    truncated JSON. The value pattern handles escaped quotes/backslashes.
+  //    truncated JSON (incl. cut off MID-value, with no closing quote). The
+  //    NO trailing-quote pattern: capture the value up to the closing quote
+  //    if present, else to end-of-string. Handles escaped quotes/backslashes.
   const m = t.match(
-    new RegExp('"' + voiceField + '"\\s*:\\s*"((?:\\\\.|[^"\\\\])*)"'),
+    new RegExp('"' + voiceField + '"\\s*:\\s*"((?:\\\\.|[^"\\\\])*)'),
   );
   if (m && m[1].trim()) {
     return m[1]
