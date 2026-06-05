@@ -1233,36 +1233,30 @@ Rules:
 });
 
 // Robustly pull the speakable text out of an LLM reply that may be pure JSON,
-// prose-then-JSON, fenced JSON, or plain prose. The old handler did a naive
-// JSON.parse and gave up (→ no audio) the moment Groq added any prose/fence —
-// which is common — dropping the prefetched MP3 and forcing the app onto the
-// slower per-sentence /tts fallback. This mirrors the client's _extractJsonObject
-// and, crucially, ALWAYS returns something speakable so the combined endpoint
-// never comes back silent.
+// prose-then-JSON, fenced JSON, TRUNCATED JSON (no closing brace), or plain
+// prose. Regex-first on the field itself: this is the only approach that
+// survives a cut-off reply like `{"spoken_text":"…",` (missing the closing
+// `}`) — a balanced-brace scan fails there and dumps raw JSON to the worker
+// (and speaks it). ALWAYS returns something speakable so the combined
+// endpoint never comes back silent.
 function extractSpokenText(text, voiceField) {
   const t = (text || '').trim();
   if (!t) return '';
-  const s = t.indexOf('{');
-  if (s >= 0) {
-    let depth = 0;
-    for (let i = s; i < t.length; i++) {
-      if (t[i] === '{') depth++;
-      else if (t[i] === '}') {
-        if (--depth === 0) {
-          try {
-            const parsed = JSON.parse(t.slice(s, i + 1));
-            const v = parsed && parsed[voiceField];
-            if (typeof v === 'string' && v.trim()) return v.trim();
-          } catch (_) { /* not valid JSON — fall through to prose */ }
-          // JSON block present but no usable field → speak the prose around it.
-          const prose = (t.slice(0, s) + t.slice(i + 1)).trim();
-          return prose || t;
-        }
-      }
-    }
+  // 1. Direct field extraction — works for valid, fenced, prose-wrapped, AND
+  //    truncated JSON. The value pattern handles escaped quotes/backslashes.
+  const m = t.match(
+    new RegExp('"' + voiceField + '"\\s*:\\s*"((?:\\\\.|[^"\\\\])*)"'),
+  );
+  if (m && m[1].trim()) {
+    return m[1]
+      .replace(/\\"/g, '"')
+      .replace(/\\n/g, ' ')
+      .replace(/\\\\/g, '\\')
+      .trim();
   }
-  // No JSON at all → strip a trailing {...} tail (if any) and speak the prose.
-  return t.replace(/\{[\s\S]*\}\s*$/m, '').trim() || t;
+  // 2. No such field → it's plain prose; strip any JSON block (closed or not)
+  //    and speak the prose.
+  return t.replace(/\{[\s\S]*\}?\s*$/m, '').trim() || t;
 }
 
 // ── Combined Chat + Voice (2b) ──────────────────────────────────────────────
