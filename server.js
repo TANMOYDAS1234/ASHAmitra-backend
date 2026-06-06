@@ -860,6 +860,7 @@ const TTS_TERM_MAP = [
   [/\bMDSR\b/g, 'এম ডি এস আর'], [/\bJSSK\b/g, 'জে এস এস কে'],
   [/\bPHC\b/g, 'পি এইচ সি'], [/\bCHC\b/g, 'সি এইচ সি'],
   [/\bSDH\b/g, 'এস ডি এইচ'], [/\bORS\b/g, 'ও আর এস'],
+  [/\bFRU\b/g, 'এফ আর ইউ'], [/\bDH\b/g, 'ডি এইচ'],
   [/\bANC\b/g, 'এ এন সি'], [/\bPNC\b/g, 'পি এন সি'],
   [/\bANM\b/g, 'এ এন এম'], [/\bOPD\b/g, 'ও পি ডি'],
   [/\bIPD\b/g, 'আই পি ডি'], [/\bIFA\b/g, 'আই এফ এ'],
@@ -868,6 +869,12 @@ const TTS_TERM_MAP = [
   [/\bJSY\b/g, 'জে এস ওয়াই'], [/\bPPH\b/g, 'পি পি এইচ'],
   [/\bBP\b/g, 'বি পি'], [/\bTT\b/g, 'টি টি'],
   [/\bHb\b/g, 'হিমোগ্লোবিন'], [/\bHB\b/g, 'হিমোগ্লোবিন'],
+  // Emergency dial numbers — spoken digit-by-digit so they're unambiguous
+  // ("এক শূন্য আট", not "একশো আট"). Both Latin and Bengali digits, guarded
+  // so they never match inside a longer number.
+  [/(?<![0-9০-৯])108(?![0-9০-৯])/g, 'এক শূন্য আট'], [/(?<![0-9০-৯])১০৮(?![0-9০-৯])/g, 'এক শূন্য আট'],
+  [/(?<![0-9০-৯])102(?![0-9০-৯])/g, 'এক শূন্য দুই'], [/(?<![0-9০-৯])১০২(?![0-9০-৯])/g, 'এক শূন্য দুই'],
+  [/(?<![0-9০-৯])104(?![0-9০-৯])/g, 'এক শূন্য চার'], [/(?<![0-9০-৯])১০৪(?![0-9০-৯])/g, 'এক শূন্য চার'],
   // Common English domain words the bn voice garbles
   [/\bvaccination\b/gi, 'ভ্যাকসিনেশন'], [/\bvaccine\b/gi, 'ভ্যাকসিন'],
   [/\breferral\b/gi, 'রেফারেল'], [/\brefer\b/gi, 'রেফার'],
@@ -879,10 +886,18 @@ const TTS_TERM_MAP = [
 ];
 
 function normalizeForSpeech(text) {
+  // Number ranges "X-Y" (e.g. "৫-৭", "১৫-২০", "৮০-৮২") → "X থেকে Y" so the
+  // voice says "পাঁচ থেকে সাত" (five TO seven) instead of reading the hyphen
+  // as "minus". Bounded to 1–3 digit groups and guarded by lookaround so
+  // phone numbers (1800-180-1104) and decimals (38.5-41.0) stay untouched.
+  let t = text.replace(
+    /(?<![0-9০-৯.])([0-9০-৯]{1,3})\s*[-–—]\s*([0-9০-৯]{1,3})(?![0-9০-৯.])/g,
+    '$1 থেকে $2',
+  );
   // "X/Y" between digits (Bengali ০-৯ or Latin 0-9) → "X বাটা Y" so the
   // voice says "একশো পঞ্চাশ বাটা পঁচানব্বই" for a BP reading instead of
   // reading the slash literally or dropping it.
-  let t = text.replace(/([0-9০-৯])\s*\/\s*([0-9০-৯])/g, '$1 বাটা $2');
+  t = t.replace(/([0-9০-৯])\s*\/\s*([0-9০-৯])/g, '$1 বাটা $2');
   for (const [re, sub] of TTS_TERM_MAP) t = t.replace(re, sub);
   return t.replace(/\s+/g, ' ').trim();
 }
