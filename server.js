@@ -1024,17 +1024,20 @@ app.get('/api/voice-preview', async (req, res) => {
   }
 });
 
-// ── AI Chat Proxy (Groq primary, Gemini fallback) ────────────────────────────
+// ── AI Chat Proxy (Gemini primary, Groq fallback) ────────────────────────────
 // Gemini keys are picked up dynamically from any env var matching
-// /^GEMINI_API_KEY(_\d+)?$/ — adding keys is a Render env-var change, not a
+// /^GEMINI_API_KEY(_\d+)?$/ — adding keys is an env-var change, not a
 // code change:
 //   GEMINI_API_KEY        ← set this to the PAID key (no daily cap → reliable)
 //   GEMINI_API_KEY_2/_3…  ← optional extra (free) keys, round-robined in
 // Recommended for production: ONE paid key as GEMINI_API_KEY and no free
-// extras — the paid key has no daily quota, so the fallback never fails on
+// extras — the paid key has no daily quota, so it never fails on
 // "AI at capacity", and there's nothing to rotate. (Free keys give only
-// 1,500 req/day each, which is why multiple were stacked before.) Groq stays
-// the primary; Gemini is only hit when Groq is unavailable/rate-limited.
+// 1,500 req/day each, which is why multiple were stacked before.)
+// Gemini is the PRIMARY provider — its Bengali/clinical replies follow the
+// triage prompt far better than Groq's llama. Groq is the FALLBACK, hit only
+// when Gemini is unavailable/rate-limited, so the app never drops to offline
+// rules while online.
 function loadGeminiKeys() {
   const keys = [];
   for (const [name, value] of Object.entries(process.env)) {
@@ -1148,6 +1151,22 @@ async function resolveChatReply(prompt, skipCache) {
       return { text: hit.text, provider: hit.provider, cached: true };
     }
   }
+  // ── Primary: Gemini (paid key — best Bengali/clinical quality) ──
+  // A thrown/empty Gemini result falls through to Groq below so a hiccup or
+  // rate-limit never drops triage to the client's offline rules.
+  if (geminiKeys.length > 0) {
+    try {
+      const text = await callGemini(prompt);
+      if (text) {
+        await saveToAiCache(key, prompt, text, 'gemini');
+        return { text, provider: 'gemini', cached: false };
+      }
+      console.warn('[Gemini] primary returned empty, falling back to Groq');
+    } catch (err) {
+      console.warn('[Gemini] primary failed, falling back to Groq:', err.message);
+    }
+  }
+  // ── Fallback: Groq ──
   const groqKey = process.env.GROQ_API_KEY;
   if (groqKey) {
     const groqRes = await fetch('https://api.groq.com/openai/v1/chat/completions', {
@@ -1166,12 +1185,9 @@ async function resolveChatReply(prompt, skipCache) {
       if (text) await saveToAiCache(key, prompt, text, 'groq');
       return { text, provider: 'groq', cached: false };
     }
-    console.warn('[Groq] failed:', groqRes.status, groqData?.error?.message);
+    console.warn('[Groq] fallback failed:', groqRes.status, groqData?.error?.message);
   }
-  if (geminiKeys.length === 0) throw new Error('No AI provider configured');
-  const text = await callGemini(prompt);
-  if (text) await saveToAiCache(key, prompt, text, 'gemini');
-  return { text, provider: 'gemini', cached: false };
+  throw new Error('No AI provider available (Gemini + Groq both failed)');
 }
 
 app.post('/api/chat', async (req, res) => {
