@@ -155,9 +155,28 @@ function adminOnly(req, res, next) {
 }
 
 // ── Health ───────────────────────────────────────────────────────────────────
-// `build` is a deploy marker — bump it when verifying a deploy actually landed
-// on Render (e.g. confirm the spoken_text audio fix is live).
-app.get('/health', (_, res) => res.json({ success: true, message: 'AshaMitra backend is running', version: '1.0.0', build: 'gemini-no-think' }));
+// `build` is a deploy marker — bump it on every deploy so GET /health proves
+// the new code actually restarted (if the marker is stale, the auto-deploy
+// pulled but did NOT restart Node — the #1 cause of "my fix isn't live").
+// Also reports the chat provider order, Gemini key count, and which Mongo DB
+// this process is connected to (so you can confirm patients land in the Atlas
+// you're inspecting). No credentials are exposed.
+app.get('/health', (_, res) => {
+  const c = mongoose.connection;
+  res.json({
+    success: true,
+    message: 'AshaMitra backend is running',
+    version: '1.0.0',
+    build: 'gemini-primary+health-db-2026-06',
+    chatPrimary: 'gemini', // resolveChatReply tries Gemini first, Groq fallback
+    geminiKeys: (typeof geminiKeys !== 'undefined' && geminiKeys) ? geminiKeys.length : 0,
+    db: {
+      name: c && c.name ? c.name : null,
+      host: c && c.host ? c.host : null,
+      readyState: c ? c.readyState : -1, // 1 = connected
+    },
+  });
+});
 
 // ── Auth ──────────────────────────────────────────────────────────────────────
 
