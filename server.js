@@ -167,7 +167,7 @@ app.get('/health', (_, res) => {
     success: true,
     message: 'AshaMitra backend is running',
     version: '1.0.0',
-    build: 'gemini-primary+health-db-2026-06',
+    build: 'gemini-primary+hindi-tts-2026-06',
     chatPrimary: 'gemini', // resolveChatReply tries Gemini first, Groq fallback
     geminiKeys: (typeof geminiKeys !== 'undefined' && geminiKeys) ? geminiKeys.length : 0,
     db: {
@@ -904,20 +904,61 @@ const TTS_TERM_MAP = [
   [/\bkg\b/g, ' কেজি'], [/%/g, ' শতাংশ'],
 ];
 
-function normalizeForSpeech(text) {
-  // Number ranges "X-Y" (e.g. "৫-৭", "১৫-২০", "৮০-৮২") → "X থেকে Y" so the
-  // voice says "পাঁচ থেকে সাত" (five TO seven) instead of reading the hyphen
-  // as "minus". Bounded to 1–3 digit groups and guarded by lookaround so
-  // phone numbers (1800-180-1104) and decimals (38.5-41.0) stay untouched.
+// Hindi (Devanagari) equivalents — used when the reply is in Hindi so the
+// HINDI voice says these terms naturally instead of a Bengali voice mangling
+// them. Mirrors TTS_TERM_MAP but in Devanagari.
+const TTS_TERM_MAP_HI = [
+  [/\bmg\s*\/\s*kg\b/g, ' मिलीग्राम प्रति किलो'],
+  [/\b\/\s*day\b/gi, ' प्रतिदिन'],
+  [/\bSNCU\b/g, 'एस एन सी यू'], [/\bNICU\b/g, 'एन आई सी यू'],
+  [/\bHBNC\b/g, 'एच बी एन सी'], [/\bMDSR\b/g, 'एम डी एस आर'],
+  [/\bPHC\b/g, 'पी एच सी'], [/\bCHC\b/g, 'सी एच सी'],
+  [/\bSDH\b/g, 'एस डी एच'], [/\bORS\b/g, 'ओ आर एस'],
+  [/\bFRU\b/g, 'एफ आर यू'], [/\bDH\b/g, 'डी एच'],
+  [/\bANC\b/g, 'ए एन सी'], [/\bPNC\b/g, 'पी एन सी'],
+  [/\bANM\b/g, 'ए एन एम'], [/\bMCP\b/g, 'एम सी पी'],
+  [/\bPPH\b/g, 'पी पी एच'], [/\bBP\b/g, 'बी पी'],
+  [/\bHb\b/g, 'हीमोग्लोबिन'], [/\bHB\b/g, 'हीमोग्लोबिन'],
+  [/(?<![0-9০-৯०-९])108(?![0-9০-৯०-९])/g, 'एक शून्य आठ'],
+  [/(?<![0-9০-৯०-९])102(?![0-9০-৯०-९])/g, 'एक शून्य दो'],
+  [/(?<![0-9০-৯०-९])104(?![0-9০-৯०-९])/g, 'एक शून्य चार'],
+  [/\bvaccination\b/gi, 'वैक्सीनेशन'], [/\bvaccine\b/gi, 'वैक्सीन'],
+  [/\breferral\b/gi, 'रेफ़रल'], [/\brefer\b/gi, 'रेफ़र'],
+  [/\breport\b/gi, 'रिपोर्ट'], [/\bcheck\s*up\b/gi, 'चेकअप'],
+  [/°\s*C\b/g, ' डिग्री सेल्सियस'], [/°\s*F\b/g, ' डिग्री फ़ारेनहाइट'],
+  [/\bmg\b/g, ' मिलीग्राम'], [/\bml\b/g, ' मिलीलीटर'],
+  [/\bkg\b/g, ' किलो'], [/%/g, ' प्रतिशत'],
+];
+
+// Per-language TTS config: voice, Google languageCode, term map, and the words
+// for a number range ("X to Y") and the BP slash ("X over Y"). Hindi voice is
+// env-overridable (GOOGLE_TTS_VOICE_HI) so it can be tuned without a code change.
+const TTS_LANGS = {
+  bn: { voice: process.env.GOOGLE_TTS_VOICE    || 'bn-IN-Wavenet-A', terms: TTS_TERM_MAP,    range: 'থেকে', slash: 'বাটা' },
+  hi: { voice: process.env.GOOGLE_TTS_VOICE_HI || 'hi-IN-Neural2-A', terms: TTS_TERM_MAP_HI, range: 'से',   slash: 'बटा' },
+};
+
+// Pick the spoken language from the dominant script of the reply. Devanagari
+// present → Hindi voice; otherwise Bengali voice (which also reads Indian
+// English acceptably — that path is unchanged).
+function detectTtsLang(text) {
+  const hi = (text.match(/[ऀ-ॿ]/g) || []).length;
+  const bn = (text.match(/[ঀ-৿]/g) || []).length;
+  return (hi > 0 && hi >= bn) ? 'hi' : 'bn';
+}
+
+function normalizeForSpeech(text, lang = 'bn') {
+  const cfg = TTS_LANGS[lang] || TTS_LANGS.bn;
+  // Number ranges "X-Y" → "X <range> Y" (Bengali "থেকে" / Hindi "से") so the
+  // voice doesn't read the hyphen as "minus". Includes Devanagari digits.
+  // Guarded so phone numbers (1800-180-1104) and decimals (38.5-41.0) stay put.
   let t = text.replace(
-    /(?<![0-9০-৯.])([0-9০-৯]{1,3})\s*[-–—]\s*([0-9০-৯]{1,3})(?![0-9০-৯.])/g,
-    '$1 থেকে $2',
+    /(?<![0-9০-৯०-९.])([0-9০-৯०-९]{1,3})\s*[-–—]\s*([0-9০-৯०-९]{1,3})(?![0-9০-৯०-९.])/g,
+    `$1 ${cfg.range} $2`,
   );
-  // "X/Y" between digits (Bengali ০-৯ or Latin 0-9) → "X বাটা Y" so the
-  // voice says "একশো পঞ্চাশ বাটা পঁচানব্বই" for a BP reading instead of
-  // reading the slash literally or dropping it.
-  t = t.replace(/([0-9০-৯])\s*\/\s*([0-9০-৯])/g, '$1 বাটা $2');
-  for (const [re, sub] of TTS_TERM_MAP) t = t.replace(re, sub);
+  // "X/Y" between digits → "X <slash> Y" (BP reading) instead of a literal slash.
+  t = t.replace(/([0-9০-৯०-९])\s*\/\s*([0-9০-৯०-९])/g, `$1 ${cfg.slash} $2`);
+  for (const [re, sub] of cfg.terms) t = t.replace(re, sub);
   return t.replace(/\s+/g, ' ').trim();
 }
 
@@ -933,10 +974,10 @@ function normalizeForSpeech(text) {
 // every clause feel beat-by-beat instead of flowing. Periods, question
 // marks, and the new sentence-break-on-". A" rule still give the engine
 // the breath cues it needs.
-function ttsToSsml(text) {
-  // Pronunciation pass FIRST — turns "BP 150/95" etc. into speakable Bengali
+function ttsToSsml(text, lang = 'bn') {
+  // Pronunciation pass FIRST — turns "BP 150/95" etc. into speakable script
   // before comma-strip / escaping / break-tagging below.
-  const spoken = normalizeForSpeech(text);
+  const spoken = normalizeForSpeech(text, lang);
   const cleaned = spoken.replace(/,/g, ' ').replace(/\s+/g, ' ').trim();
   const esc = cleaned.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
   return `<speak>${esc
@@ -950,8 +991,8 @@ function ttsToSsml(text) {
 
 // Plain-text (no-SSML) variant of the spoken text — normalized pronunciation
 // + comma strip, but no <break> tags. Used for voices that reject SSML.
-function ttsPlainText(text) {
-  return normalizeForSpeech(text).replace(/,/g, ' ').replace(/\s+/g, ' ').trim();
+function ttsPlainText(text, lang = 'bn') {
+  return normalizeForSpeech(text, lang).replace(/,/g, ' ').replace(/\s+/g, ' ').trim();
 }
 
 // Shared synth helper — used by /api/tts, /api/chat-with-voice, and the voice
@@ -965,14 +1006,19 @@ function ttsPlainText(text) {
 async function synthesizeTts(text, tone = 'normal', voiceName) {
   if (!ttsClient) throw new Error('TTS not configured');
   const p = TTS_TONE_PROFILES[tone] || TTS_TONE_PROFILES.normal;
-  const name = voiceName || process.env.GOOGLE_TTS_VOICE || 'bn-IN-Wavenet-A';
+  // Pick voice + languageCode + normalization from the reply's script, so
+  // Hindi is read by a Hindi voice (not the Bengali one). An explicit
+  // voiceName (A/B preview) still wins; its languageCode comes from its prefix.
+  const lang = detectTtsLang(text);
+  const name = voiceName || (TTS_LANGS[lang] || TTS_LANGS.bn).voice;
+  const languageCode = /^[a-z]{2}-[A-Z]{2}/.test(name) ? name.slice(0, 5) : 'bn-IN';
   const input = /chirp/i.test(name)
-    ? { text: ttsPlainText(text.trim()) }
-    : { ssml: ttsToSsml(text.trim()) };
+    ? { text: ttsPlainText(text.trim(), lang) }
+    : { ssml: ttsToSsml(text.trim(), lang) };
   const response = await ttsClient.text.synthesize({
     requestBody: {
       input,
-      voice: { languageCode: 'bn-IN', name },
+      voice: { languageCode, name },
       audioConfig: {
         audioEncoding: 'MP3',
         speakingRate: p.rate,
