@@ -167,7 +167,7 @@ app.get('/health', (_, res) => {
     success: true,
     message: 'AshaMitra backend is running',
     version: '1.0.0',
-    build: 'gemini-primary+hindi-tts-2026-06',
+    build: 'gemini-primary+autolang-stt-2026-06',
     chatPrimary: 'gemini', // resolveChatReply tries Gemini first, Groq fallback
     geminiKeys: (typeof geminiKeys !== 'undefined' && geminiKeys) ? geminiKeys.length : 0,
     db: {
@@ -1497,10 +1497,12 @@ app.post('/api/transcribe', audioRawParser, async (req, res) => {
     const blob = new Blob([req.body], { type: req.headers['content-type'] || 'audio/m4a' });
     form.append('file', blob, `audio.${ext}`);
     form.append('model', 'whisper-large-v3-turbo');
-    form.append('language', lang);
-    // response_format=verbose_json would give us per-word timestamps;
-    // for now we just want the text.
-    form.append('response_format', 'text');
+    // lang='auto' (or empty) → let Whisper auto-detect the spoken language, so a
+    // worker can speak Bengali/Hindi/English and it's transcribed in the right
+    // script. Otherwise pin the language. verbose_json so we always learn what
+    // Whisper detected and can echo it back to the app for auto-switching.
+    if (lang && lang !== 'auto') form.append('language', lang);
+    form.append('response_format', 'verbose_json');
     const resp = await fetch('https://api.groq.com/openai/v1/audio/transcriptions', {
       method: 'POST',
       headers: { 'Authorization': `Bearer ${key}` },
@@ -1516,8 +1518,8 @@ app.post('/api/transcribe', audioRawParser, async (req, res) => {
         detail: errText.slice(0, 200),
       });
     }
-    const text = (await resp.text()).trim();
-    res.json({ success: true, text });
+    const data = await resp.json();
+    res.json({ success: true, text: (data.text || '').trim(), language: data.language || null });
   } catch (e) {
     console.error('[transcribe]', e.message);
     res.status(500).json({ success: false, message: e.message });
