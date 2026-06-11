@@ -167,7 +167,7 @@ app.get('/health', (_, res) => {
     success: true,
     message: 'AshaMitra backend is running',
     version: '1.0.0',
-    build: 'gemini-primary+bn-as-hi-fix-2026-06',
+    build: 'gemini-primary+lang-normalize-2026-06',
     chatPrimary: 'gemini', // resolveChatReply tries Gemini first, Groq fallback
     geminiKeys: (typeof geminiKeys !== 'undefined' && geminiKeys) ? geminiKeys.length : 0,
     db: {
@@ -1523,6 +1523,28 @@ function looksLikeBengaliInDevanagari(text) {
   return false;
 }
 
+// The app supports only three languages. Whisper auto-detect, however, only
+// loosely distinguishes South-Asian languages and frequently MISLABELS spoken
+// Bengali/Hindi as a neighbour with a different script — observed in the field:
+//   Hindi → Urdu (Perso-Arabic),  Bengali → Gujarati / Assamese / Odia,
+//   Bengali → Hindi (Devanagari).
+// So any detected language is normalised to the nearest supported one. The
+// audio is real Bengali or Hindi (or English); we just need the right script.
+const SUPPORTED_LANGS = { bengali: 'bn', hindi: 'hi', english: 'en' };
+// Family → supported language. Perso-Arabic + Devanagari-script tongues map to
+// Hindi (Hindustani / Devanagari); Eastern-Indic, Gujarati and Dravidian map to
+// Bengali (this is a West-Bengal, Bengali-primary deployment).
+const LANG_TO_SUPPORTED = {
+  bengali: 'bn', assamese: 'bn', oriya: 'bn', odia: 'bn', gujarati: 'bn',
+  punjabi: 'bn', panjabi: 'bn', tamil: 'bn', telugu: 'bn', kannada: 'bn',
+  malayalam: 'bn', sinhala: 'bn', sinhalese: 'bn',
+  hindi: 'hi', urdu: 'hi', arabic: 'hi', persian: 'hi', farsi: 'hi',
+  pashto: 'hi', nepali: 'hi', marathi: 'hi', sanskrit: 'hi', maithili: 'hi',
+  konkani: 'hi', dogri: 'hi',
+  english: 'en',
+};
+const SUPPORTED_TO_NAME = { bn: 'bengali', hi: 'hindi', en: 'english' };
+
 app.post('/api/transcribe', audioRawParser, async (req, res) => {
   const key = process.env.GROQ_API_KEY;
   if (!key) {
@@ -1546,17 +1568,29 @@ app.post('/api/transcribe', audioRawParser, async (req, res) => {
     let text = (data.text || '').trim();
     let language = data.language || null;
 
-    // Bengali-as-Hindi correction (auto-detect only): Whisper called it Hindi
-    // but the text is clearly Bengali rendered in Devanagari. Re-transcribe the
-    // same audio forcing Bengali so the worker gets proper Bengali script — and
-    // the app's session language, reply and voice all follow Bengali downstream.
-    if (wantAuto && language === 'hindi' && looksLikeBengaliInDevanagari(text)) {
-      try {
-        const bn = await groqTranscribe(key, req.body, ctype, ext, 'bn');
-        const bnText = (bn.text || '').trim();
-        if (bnText) { text = bnText; language = 'bengali'; }
-      } catch (e) {
-        console.warn('[transcribe] bn re-transcribe failed:', e.message);
+    // Language normalisation (auto-detect only). Decide which supported language
+    // Whisper SHOULD have used, then re-transcribe forcing it so the worker's
+    // words come back in the correct script — and the app's session language,
+    // reply and voice all follow it downstream.
+    if (wantAuto) {
+      const detected = (language || '').toLowerCase().trim();
+      let target = null;
+      if (detected === 'hindi' && looksLikeBengaliInDevanagari(text)) {
+        // Bengali spoken but written in Devanagari and labelled Hindi.
+        target = 'bn';
+      } else if (detected && !SUPPORTED_LANGS[detected]) {
+        // Detected an UNSUPPORTED language (urdu, gujarati, assamese …) — a
+        // mis-detection of one of our three. Map it to the nearest supported.
+        target = LANG_TO_SUPPORTED[detected] || 'bn';
+      }
+      if (target) {
+        try {
+          const re = await groqTranscribe(key, req.body, ctype, ext, target);
+          const reText = (re.text || '').trim();
+          if (reText) { text = reText; language = SUPPORTED_TO_NAME[target]; }
+        } catch (e) {
+          console.warn(`[transcribe] re-transcribe (${target}) failed:`, e.message);
+        }
       }
     }
 
