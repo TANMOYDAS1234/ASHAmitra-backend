@@ -167,7 +167,7 @@ app.get('/health', (_, res) => {
     success: true,
     message: 'AshaMitra backend is running',
     version: '1.0.0',
-    build: 'gemini-primary+autolang-stt-2026-06',
+    build: 'gemini-primary+bn-as-hi-fix-2026-06',
     chatPrimary: 'gemini', // resolveChatReply tries Gemini first, Groq fallback
     geminiKeys: (typeof geminiKeys !== 'undefined' && geminiKeys) ? geminiKeys.length : 0,
     db: {
@@ -1478,6 +1478,51 @@ const audioRawParser = express.raw({
   limit: '10mb',
 });
 
+// One Groq Whisper transcription. `language` null → auto-detect, else pinned
+// (ISO-639-1, e.g. 'bn'). Always verbose_json so we learn the detected language.
+// Throws Error('groq_failed') with .status/.detail on a non-2xx from Groq.
+async function groqTranscribe(key, bytes, contentType, ext, language) {
+  const form = new FormData();
+  const blob = new Blob([bytes], { type: contentType || 'audio/m4a' });
+  form.append('file', blob, `audio.${ext}`);
+  form.append('model', 'whisper-large-v3-turbo');
+  if (language) form.append('language', language);
+  form.append('response_format', 'verbose_json');
+  const resp = await fetch('https://api.groq.com/openai/v1/audio/transcriptions', {
+    method: 'POST',
+    headers: { 'Authorization': `Bearer ${key}` },
+    body: form,
+  });
+  if (!resp.ok) {
+    const err = new Error('groq_failed');
+    err.status = resp.status;
+    err.detail = (await resp.text()).slice(0, 200);
+    throw err;
+  }
+  return resp.json();
+}
+
+// Whisper sometimes mis-detects spoken Bengali as Hindi and transcribes the
+// Bengali WORDS phonetically in Devanagari script — so a West-Bengal worker
+// speaking Bengali sees their sentence in हिन्दी letters. These multi-character
+// sequences are distinctive to Bengali (verb endings -ছেন/-বেন/-য়েছে, the
+// words সেটা/এটা/এখন, pronouns আমি/তুমি/আপনি, possessive জলের …) and essentially
+// never appear in genuine Hindi. We require ≥2 distinct hits so a coincidental
+// single match (e.g. अच्छे) can't flip real Hindi to Bengali.
+const BENGALI_IN_DEVANAGARI_MARKERS = [
+  'छेन', 'बेन', 'येछे', 'येछ', 'छिलो', 'कोरछि', 'कोरबे', 'होयेछे', 'होछे', 'हछे',
+  'आमि', 'आमी', 'आमार', 'तुमि', 'आपनि', 'केमोन', 'होबे', 'हबे', 'जोलेर', 'जोल',
+  'दिदि', 'शेटा', 'सेटा', 'एटा', 'एखोन', 'कोतो', 'किछु', 'नेबेन', 'देबेन', 'खेयेछ',
+];
+function looksLikeBengaliInDevanagari(text) {
+  if (!text) return false;
+  let hits = 0;
+  for (const m of BENGALI_IN_DEVANAGARI_MARKERS) {
+    if (text.includes(m) && ++hits >= 2) return true;
+  }
+  return false;
+}
+
 app.post('/api/transcribe', audioRawParser, async (req, res) => {
   const key = process.env.GROQ_API_KEY;
   if (!key) {
@@ -1488,39 +1533,41 @@ app.post('/api/transcribe', audioRawParser, async (req, res) => {
   }
   try {
     const lang = (req.query.lang || 'bn').toString();
-    // Build multipart body manually using Node's built-in FormData (Node 18+).
-    const form = new FormData();
-    // The recording on the client uses Opus in WebM container or AAC
-    // in m4a — either way Groq/Whisper auto-detects. Filename's
-    // extension carries the hint.
+    // The recording on the client uses Opus in WebM container or AAC in m4a —
+    // either way Groq/Whisper auto-detects. Filename's extension carries the hint.
     const ext = (req.query.ext || 'm4a').toString().replace(/[^a-z0-9]/gi, '');
-    const blob = new Blob([req.body], { type: req.headers['content-type'] || 'audio/m4a' });
-    form.append('file', blob, `audio.${ext}`);
-    form.append('model', 'whisper-large-v3-turbo');
+    const ctype = req.headers['content-type'] || 'audio/m4a';
     // lang='auto' (or empty) → let Whisper auto-detect the spoken language, so a
     // worker can speak Bengali/Hindi/English and it's transcribed in the right
-    // script. Otherwise pin the language. verbose_json so we always learn what
-    // Whisper detected and can echo it back to the app for auto-switching.
-    if (lang && lang !== 'auto') form.append('language', lang);
-    form.append('response_format', 'verbose_json');
-    const resp = await fetch('https://api.groq.com/openai/v1/audio/transcriptions', {
-      method: 'POST',
-      headers: { 'Authorization': `Bearer ${key}` },
-      body: form,
-    });
-    if (!resp.ok) {
-      const errText = await resp.text();
-      console.warn('[transcribe] Groq error:', resp.status, errText);
+    // script. Otherwise pin the language.
+    const wantAuto = !lang || lang === 'auto';
+
+    let data = await groqTranscribe(key, req.body, ctype, ext, wantAuto ? null : lang);
+    let text = (data.text || '').trim();
+    let language = data.language || null;
+
+    // Bengali-as-Hindi correction (auto-detect only): Whisper called it Hindi
+    // but the text is clearly Bengali rendered in Devanagari. Re-transcribe the
+    // same audio forcing Bengali so the worker gets proper Bengali script — and
+    // the app's session language, reply and voice all follow Bengali downstream.
+    if (wantAuto && language === 'hindi' && looksLikeBengaliInDevanagari(text)) {
+      try {
+        const bn = await groqTranscribe(key, req.body, ctype, ext, 'bn');
+        const bnText = (bn.text || '').trim();
+        if (bnText) { text = bnText; language = 'bengali'; }
+      } catch (e) {
+        console.warn('[transcribe] bn re-transcribe failed:', e.message);
+      }
+    }
+
+    res.json({ success: true, text, language });
+  } catch (e) {
+    if (e.message === 'groq_failed') {
+      console.warn('[transcribe] Groq error:', e.status, e.detail);
       return res.status(502).json({
-        success: false,
-        message: 'groq_failed',
-        status: resp.status,
-        detail: errText.slice(0, 200),
+        success: false, message: 'groq_failed', status: e.status, detail: e.detail,
       });
     }
-    const data = await resp.json();
-    res.json({ success: true, text: (data.text || '').trim(), language: data.language || null });
-  } catch (e) {
     console.error('[transcribe]', e.message);
     res.status(500).json({ success: false, message: e.message });
   }
