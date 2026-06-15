@@ -57,6 +57,11 @@ const patientSchema = new mongoose.Schema({
   motherId:      { type: mongoose.Schema.Types.ObjectId, ref: 'Patient', default: null },
   isTwin:        { type: Boolean, default: false },
   birthOrder:    { type: Number,  default: 0 }, // 1, 2 … within a multiple birth
+  // Full MCP-card identity fields (pg 3) — father's name, address, RCH/MCTS no.,
+  // PMMVY/JSY + bank, gravida, birth-registration no., Anganwadi/LGD, facility,
+  // masked Aadhaar, etc. Kept as a flexible map (all optional) rather than ~27
+  // columns; the registration form drives the keys.
+  mcpDetails:    { type: mongoose.Schema.Types.Mixed, default: {} },
   // Optimistic concurrency control. Incremented on every successful update.
   // PUT requests carry the version they're updating from; if it no longer
   // matches the server's, the update is rejected 409 so the client can
@@ -144,6 +149,9 @@ const scheduleEventSchema = new mongoose.Schema({
   // single event never re-sends the same reminder.
   remindersSent: { type: [String], default: [] },
   meta:          { type: mongoose.Schema.Types.Mixed, default: {} }, // e.g. { vaccines: [...] }
+  // What the worker recorded when completing the visit: ANC vitals
+  // (bp/weight/hb), vaccines actually given, danger-sign flags, free notes.
+  record:        { type: mongoose.Schema.Types.Mixed, default: {} },
 }, { timestamps: true });
 scheduleEventSchema.index({ patientId: 1, kind: 1, code: 1 }, { unique: true });
 
@@ -262,15 +270,13 @@ function normalizeMchDates(body) {
 // A lightweight in-process scheduler (no extra dependency) scans pending
 // schedule events and fires reminders at three lead-times — 3 days before,
 // 1 day before, and once overdue — deduped via each event's `remindersSent`.
-// Channels:
-//   1. Worker in-app notification — ALWAYS on; surfaces through the app's
-//      existing /api/notifications poll. This makes reminders automatic with
-//      zero external setup.
-//   2. SMS to the mother      — active only when SMS_API_URL + SMS_API_KEY are set.
-//   3. WhatsApp to the mother — active only when WHATSAPP_TOKEN + WHATSAPP_PHONE_ID are set.
-// SMS + WhatsApp are skipped (no-op) until their credentials exist in .env, so
-// the system works today and the mother-facing channels light up the moment
-// the provider keys are added — no code change needed.
+// The worker does NOT get separate push notifications — they use the live
+// due/overdue shortlist instead. Reminders go to the MOTHER over:
+//   1. SMS      — active only when SMS_API_URL + SMS_API_KEY are set.
+//   2. WhatsApp — active only when WHATSAPP_TOKEN + WHATSAPP_PHONE_ID are set.
+// Both are skipped (no-op) until their credentials exist in .env. A lead-time
+// is marked "sent" only when a channel actually delivered, so once the keys
+// are added, pending/overdue items fire on the next scan.
 
 function reminderText(e) {
   const who = e.patientName || 'রোগী';
@@ -336,18 +342,14 @@ async function runReminderScan() {
       if (!tag || (e.remindersSent || []).includes(tag)) continue;
 
       const text = reminderText(e);
-      // 1. Worker in-app notification (always).
-      await notifyUser({
-        recipientId: e.ashaId,
-        type: 'follow_up',
-        title: days < 0 ? `বকেয়া: ${e.label}` : `আসন্ন: ${e.label}`,
-        body: `${e.patientName || 'রোগী'} — ${text}`,
-        link: '/schedule/due',
-        data: { scheduleId: e._id.toString(), patientId: e.patientId, kind: e.kind, tag },
-      });
-      // 2 + 3. Mother-facing channels (no-op until configured in .env).
-      await sendSmsReminder(e.patientMobile, text);
-      await sendWhatsappReminder(e.patientMobile, text);
+      // Mother-facing reminders only (no separate worker notification — the
+      // worker uses the due-list shortlist). Mark the lead-time as sent ONLY
+      // when a channel actually delivered, so when the SMS/WhatsApp keys are
+      // added later, still-pending items fire on the next scan.
+      let sent = false;
+      if (await sendSmsReminder(e.patientMobile, text)) sent = true;
+      if (await sendWhatsappReminder(e.patientMobile, text)) sent = true;
+      if (!sent) continue;
 
       e.remindersSent = [...(e.remindersSent || []), tag];
       await e.save();
@@ -664,11 +666,12 @@ app.get('/api/schedule', auth, async (req, res) => {
 // Mark an event done / missed / skipped (worker tap on the shortlist).
 app.patch('/api/schedule/:id', auth, async (req, res) => {
   try {
-    const { status, doneDate } = req.body || {};
+    const { status, doneDate, record } = req.body || {};
     const allowed = ['pending', 'done', 'missed', 'skipped'];
     const set = {};
     if (status && allowed.includes(status)) set.status = status;
     if (status === 'done') set.doneDate = doneDate ? new Date(doneDate) : new Date();
+    if (record && typeof record === 'object') set.record = record;
     const event = await ScheduleEvent.findOneAndUpdate(
       { _id: req.params.id, ashaId: req.user.id },
       { $set: set },
