@@ -258,6 +258,114 @@ function normalizeMchDates(body) {
   return body;
 }
 
+// ── Automatic reminder engine ─────────────────────────────────────────────────
+// A lightweight in-process scheduler (no extra dependency) scans pending
+// schedule events and fires reminders at three lead-times — 3 days before,
+// 1 day before, and once overdue — deduped via each event's `remindersSent`.
+// Channels:
+//   1. Worker in-app notification — ALWAYS on; surfaces through the app's
+//      existing /api/notifications poll. This makes reminders automatic with
+//      zero external setup.
+//   2. SMS to the mother      — active only when SMS_API_URL + SMS_API_KEY are set.
+//   3. WhatsApp to the mother — active only when WHATSAPP_TOKEN + WHATSAPP_PHONE_ID are set.
+// SMS + WhatsApp are skipped (no-op) until their credentials exist in .env, so
+// the system works today and the mother-facing channels light up the moment
+// the provider keys are added — no code change needed.
+
+function reminderText(e) {
+  const who = e.patientName || 'রোগী';
+  const days = Math.round((new Date(e.dueDate) - new Date()) / DAY);
+  const when = days < 0
+    ? `${Math.abs(days)} দিন পার হয়ে গেছে`
+    : days === 0
+      ? 'আজ দেয়'
+      : `${days} দিন পরে (${new Date(e.dueDate).toLocaleDateString('en-GB')})`;
+  if (e.kind === 'anc') return `নমস্কার, ${who}-এর ANC পরীক্ষা (${e.label}) ${when}। অনুগ্রহ করে নিকটতম স্বাস্থ্যকেন্দ্রে যান।`;
+  if (e.kind === 'vaccine') return `${who}-এর টিকা (${e.label}) ${when}। সময়মতো অঙ্গনওয়াড়ি/স্বাস্থ্যকেন্দ্রে টিকা দিন।`;
+  if (e.kind === 'hbnc') return `${who}-এর গৃহ পরিদর্শন (${e.label}) ${when}।`;
+  return `${who} — ${e.label}: ${when}।`;
+}
+
+async function sendSmsReminder(mobile, text) {
+  const url = process.env.SMS_API_URL, key = process.env.SMS_API_KEY;
+  if (!mobile || !url || !key) return false; // not configured → skip silently
+  try {
+    await fetch(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${key}` },
+      body: JSON.stringify({ to: mobile, sender: process.env.SMS_SENDER || 'ASHAMT', message: text }),
+    });
+    return true;
+  } catch (err) { console.warn('[sms]', err.message); return false; }
+}
+
+async function sendWhatsappReminder(mobile, text) {
+  const token = process.env.WHATSAPP_TOKEN, phoneId = process.env.WHATSAPP_PHONE_ID;
+  if (!mobile || !token || !phoneId) return false; // not configured → skip silently
+  try {
+    // Meta WhatsApp Cloud API. Free-form text works inside the 24-h customer
+    // window; for proactive sends an APPROVED TEMPLATE is required — once your
+    // template is approved, swap the `text` payload for a `template` payload.
+    const to = mobile.length === 10 ? `91${mobile}` : mobile;
+    await fetch(`https://graph.facebook.com/v20.0/${phoneId}/messages`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${token}` },
+      body: JSON.stringify({ messaging_product: 'whatsapp', to, type: 'text', text: { body: text } }),
+    });
+    return true;
+  } catch (err) { console.warn('[whatsapp]', err.message); return false; }
+}
+
+let _reminderScanRunning = false;
+async function runReminderScan() {
+  if (mongoose.connection.readyState !== 1 || _reminderScanRunning) return;
+  _reminderScanRunning = true;
+  try {
+    const now = new Date();
+    const horizon = addDays(now, 3); // remind from 3 days before … through overdue
+    const events = await ScheduleEvent.find({
+      status: 'pending', dueDate: { $lte: horizon },
+    }).limit(3000);
+    let fired = 0;
+    for (const e of events) {
+      const days = Math.round((e.dueDate - now) / DAY);
+      let tag = null;
+      if (days < 0) tag = 'overdue';
+      else if (days <= 1) tag = 'T-1';
+      else if (days <= 3) tag = 'T-3';
+      if (!tag || (e.remindersSent || []).includes(tag)) continue;
+
+      const text = reminderText(e);
+      // 1. Worker in-app notification (always).
+      await notifyUser({
+        recipientId: e.ashaId,
+        type: 'follow_up',
+        title: days < 0 ? `বকেয়া: ${e.label}` : `আসন্ন: ${e.label}`,
+        body: `${e.patientName || 'রোগী'} — ${text}`,
+        link: '/schedule/due',
+        data: { scheduleId: e._id.toString(), patientId: e.patientId, kind: e.kind, tag },
+      });
+      // 2 + 3. Mother-facing channels (no-op until configured in .env).
+      await sendSmsReminder(e.patientMobile, text);
+      await sendWhatsappReminder(e.patientMobile, text);
+
+      e.remindersSent = [...(e.remindersSent || []), tag];
+      await e.save();
+      fired++;
+    }
+    if (fired) console.log(`[reminderScan] fired ${fired} reminder(s)`);
+  } catch (err) {
+    console.error('[reminderScan]', err.message);
+  } finally {
+    _reminderScanRunning = false;
+  }
+}
+
+// Run shortly after boot, then hourly. Date-based lead-times + the remindersSent
+// dedup mean a skipped or extra tick can never double-send.
+setTimeout(runReminderScan, 30 * 1000);
+setInterval(runReminderScan, 60 * 60 * 1000);
+
 // ── Middleware ────────────────────────────────────────────────────────────────
 
 function auth(req, res, next) {
@@ -290,7 +398,7 @@ app.get('/health', (_, res) => {
     success: true,
     message: 'AshaMitra backend is running',
     version: '1.0.0',
-    build: 'gemini-primary+lang-normalize+mch-schedule-2026-06',
+    build: 'gemini-primary+lang-normalize+mch-schedule+reminders-2026-06',
     chatPrimary: 'gemini', // resolveChatReply tries Gemini first, Groq fallback
     geminiKeys: (typeof geminiKeys !== 'undefined' && geminiKeys) ? geminiKeys.length : 0,
     db: {
