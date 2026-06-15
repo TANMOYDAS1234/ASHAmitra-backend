@@ -42,6 +42,21 @@ const patientSchema = new mongoose.Schema({
   reason:    String,
   nextStep:  String,
   qaHistory: { type: Array, default: [] },
+  // ── Maternal & child tracking (MCP-card aligned) ─────────────────────────
+  // Dates are the keystone: ANC and immunization due-dates are computed from
+  // LMP (pregnancy) and DOB (child/newborn). Without these, no reminder or
+  // due-list is possible. All optional so existing/quick records still save.
+  dob:           { type: Date,   default: null }, // child / newborn date of birth
+  lmp:           { type: Date,   default: null }, // last menstrual period (pregnancy)
+  edd:           { type: Date,   default: null }, // expected delivery date (auto = lmp + 280d)
+  guardianName:  { type: String, default: '' },   // mother's name when patient is a child
+  // Aadhaar: store ONLY a masked form (e.g. "XXXX-XXXX-1234") — never the raw
+  // 12-digit number (Aadhaar Act sensitivity). OCR fills name/DOB/address.
+  aadhaarMasked: { type: String, default: '' },
+  // Mother ↔ child linkage + multiple birth (twins).
+  motherId:      { type: mongoose.Schema.Types.ObjectId, ref: 'Patient', default: null },
+  isTwin:        { type: Boolean, default: false },
+  birthOrder:    { type: Number,  default: 0 }, // 1, 2 … within a multiple birth
   // Optimistic concurrency control. Incremented on every successful update.
   // PUT requests carry the version they're updating from; if it no longer
   // matches the server's, the update is rejected 409 so the client can
@@ -107,11 +122,37 @@ const aiCacheSchema = new mongoose.Schema({
   lastUsedAt: { type: Date,   default: Date.now },
 }, { timestamps: true });
 
-const User         = mongoose.model('User',         userSchema);
-const Patient      = mongoose.model('Patient',      patientSchema);
-const Report       = mongoose.model('Report',       reportSchema);
-const Notification = mongoose.model('Notification', notificationSchema);
-const AiCache      = mongoose.model('AiCache',      aiCacheSchema);
+// ── Schedule events (ANC visits, immunization, HBNC newborn home visits) ──────
+// One document per due item, with a computed `dueDate`. This collection powers
+// (a) the worker's "due / overdue" shortlist, (b) the per-patient timeline,
+// (c) the reminder cron (which scans pending events nearing/past dueDate).
+// Denormalized patientName/patientMobile so list + reminder queries don't need
+// a join. Uniqueness is (patientId, kind, code) so re-saving a patient re-syncs
+// dates in place instead of duplicating.
+const scheduleEventSchema = new mongoose.Schema({
+  ashaId:        { type: mongoose.Schema.Types.ObjectId, ref: 'User',    required: true, index: true },
+  patientId:     { type: mongoose.Schema.Types.ObjectId, ref: 'Patient', required: true, index: true },
+  patientName:   { type: String, default: '' },
+  patientMobile: { type: String, default: '' },
+  kind:          { type: String, required: true }, // anc | vaccine | hbnc | followup
+  code:          { type: String, required: true }, // ANC1 | V-6W | HBNC-D7 …
+  label:         { type: String, default: '' },
+  dueDate:       { type: Date,   required: true, index: true },
+  status:        { type: String, default: 'pending' }, // pending | done | missed | skipped
+  doneDate:      { type: Date,   default: null },
+  // Lead-times already fired by the reminder cron ('T-3','T-1','overdue') so a
+  // single event never re-sends the same reminder.
+  remindersSent: { type: [String], default: [] },
+  meta:          { type: mongoose.Schema.Types.Mixed, default: {} }, // e.g. { vaccines: [...] }
+}, { timestamps: true });
+scheduleEventSchema.index({ patientId: 1, kind: 1, code: 1 }, { unique: true });
+
+const User          = mongoose.model('User',          userSchema);
+const Patient       = mongoose.model('Patient',       patientSchema);
+const Report        = mongoose.model('Report',        reportSchema);
+const Notification  = mongoose.model('Notification',  notificationSchema);
+const AiCache       = mongoose.model('AiCache',       aiCacheSchema);
+const ScheduleEvent = mongoose.model('ScheduleEvent', scheduleEventSchema);
 
 // ── Helper: create one notification per active admin ──────────────────────────
 async function notifyAllAdmins({ type, title, body, link = '', data = {} }) {
@@ -133,6 +174,88 @@ async function notifyUser({ recipientId, type, title, body, link = '', data = {}
   } catch (e) {
     console.error('[notifyUser]', e.message);
   }
+}
+
+// ── Schedule generation (ANC / immunization / HBNC) ───────────────────────────
+// Due-dates are derived from LMP (ANC) and DOB (vaccines, HBNC). The vaccine
+// plan follows the UIP national schedule as printed on the MCP card (pg 38),
+// including PCV. One schedule-event per visit milestone (vaccines for that
+// visit live in meta.vaccines) so the worker's list stays ~10 rows per child.
+const DAY = 24 * 60 * 60 * 1000;
+function addDays(date, n) { return new Date(new Date(date).getTime() + n * DAY); }
+
+const ANC_PLAN = [
+  { code: 'ANC1', label: 'ANC ১ম পরীক্ষা (প্রথম ত্রৈমাসিক)', weeks: 12 },
+  { code: 'ANC2', label: 'ANC ২য় পরীক্ষা',                   weeks: 20 },
+  { code: 'ANC3', label: 'ANC ৩য় পরীক্ষা',                   weeks: 30 },
+  { code: 'ANC4', label: 'ANC ৪র্থ পরীক্ষা',                  weeks: 36 },
+];
+
+const VACCINE_PLAN = [
+  { code: 'V-BIRTH', label: 'জন্মের টিকা',          days: 0,    vaccines: ['BCG', 'OPV-0', 'Hepatitis B-0'] },
+  { code: 'V-6W',    label: '৬ সপ্তাহের টিকা',       days: 42,   vaccines: ['Pentavalent-1', 'OPV-1', 'Rotavirus-1', 'fIPV-1', 'PCV-1'] },
+  { code: 'V-10W',   label: '১০ সপ্তাহের টিকা',      days: 70,   vaccines: ['Pentavalent-2', 'OPV-2', 'Rotavirus-2'] },
+  { code: 'V-14W',   label: '১৪ সপ্তাহের টিকা',      days: 98,   vaccines: ['Pentavalent-3', 'OPV-3', 'Rotavirus-3', 'fIPV-2', 'PCV-2'] },
+  { code: 'V-9M',    label: '৯ মাসের টিকা',          days: 270,  vaccines: ['MR-1', 'Vitamin A-1', 'JE-1', 'PCV-Booster'] },
+  { code: 'V-16M',   label: '১৬–২৪ মাসের টিকা',      days: 480,  vaccines: ['DPT booster-1', 'MR-2', 'OPV booster', 'Vitamin A-2', 'JE-2'] },
+  { code: 'V-5Y',    label: '৫–৬ বছরের টিকা',        days: 1825, vaccines: ['DPT booster-2'] },
+  { code: 'V-10Y',   label: '১০ বছরের টিকা',         days: 3650, vaccines: ['TD'] },
+  { code: 'V-16Y',   label: '১৬ বছরের টিকা',         days: 5840, vaccines: ['TD'] },
+];
+
+// Home-Based Newborn Care visits (institutional-delivery schedule).
+const HBNC_PLAN = [
+  { code: 'HBNC-D3',  label: 'গৃহ পরিদর্শন — ৩য় দিন',   days: 3 },
+  { code: 'HBNC-D7',  label: 'গৃহ পরিদর্শন — ৭ম দিন',    days: 7 },
+  { code: 'HBNC-D14', label: 'গৃহ পরিদর্শন — ১৪তম দিন',  days: 14 },
+  { code: 'HBNC-D21', label: 'গৃহ পরিদর্শন — ২১তম দিন',  days: 21 },
+  { code: 'HBNC-D28', label: 'গৃহ পরিদর্শন — ২৮তম দিন',  days: 28 },
+];
+
+// Re-sync a patient's schedule after create/update. Upserts each computed event
+// by (patientId, kind, code): dates/labels are refreshed in place, but an
+// event already marked done/missed keeps its status (only set on insert).
+async function syncScheduleForPatient(p) {
+  try {
+    if (!p || !p._id) return;
+    const type = (p.type || '').toLowerCase();
+    const isPregnancy = type.includes('preg') || type.includes('গর্ভ');
+    const isNewborn   = type.includes('newborn') || type.includes('নবজাত');
+
+    const planned = [];
+    if (p.lmp && isPregnancy) {
+      for (const a of ANC_PLAN) planned.push({ kind: 'anc', code: a.code, label: a.label, dueDate: addDays(p.lmp, a.weeks * 7), meta: {} });
+    }
+    if (p.dob) {
+      for (const v of VACCINE_PLAN) planned.push({ kind: 'vaccine', code: v.code, label: v.label, dueDate: addDays(p.dob, v.days), meta: { vaccines: v.vaccines } });
+      if (isNewborn) {
+        for (const h of HBNC_PLAN) planned.push({ kind: 'hbnc', code: h.code, label: h.label, dueDate: addDays(p.dob, h.days), meta: {} });
+      }
+    }
+    for (const e of planned) {
+      await ScheduleEvent.updateOne(
+        { patientId: p._id, kind: e.kind, code: e.code },
+        {
+          $set: {
+            ashaId: p.ashaId, patientName: p.name || '', patientMobile: p.mobile || '',
+            label: e.label, dueDate: e.dueDate, meta: e.meta,
+          },
+          $setOnInsert: { status: 'pending', remindersSent: [] },
+        },
+        { upsert: true },
+      );
+    }
+  } catch (e) {
+    console.error('[syncScheduleForPatient]', e.message);
+  }
+}
+
+// EDD defaults to LMP + 280 days (Naegele) when not explicitly provided.
+function normalizeMchDates(body) {
+  if (body && body.lmp && !body.edd) {
+    body.edd = addDays(body.lmp, 280);
+  }
+  return body;
 }
 
 // ── Middleware ────────────────────────────────────────────────────────────────
@@ -167,7 +290,7 @@ app.get('/health', (_, res) => {
     success: true,
     message: 'AshaMitra backend is running',
     version: '1.0.0',
-    build: 'gemini-primary+lang-normalize-2026-06',
+    build: 'gemini-primary+lang-normalize+mch-schedule-2026-06',
     chatPrimary: 'gemini', // resolveChatReply tries Gemini first, Groq fallback
     geminiKeys: (typeof geminiKeys !== 'undefined' && geminiKeys) ? geminiKeys.length : 0,
     db: {
@@ -278,6 +401,7 @@ app.get('/api/patients', auth, async (req, res) => {
 app.post('/api/patients', auth, async (req, res) => {
   try {
     const body = { ...req.body, ashaId: req.user.id };
+    normalizeMchDates(body);
     const name = (body.name || '').trim();
     const mobile = (body.mobile || '').trim();
 
@@ -297,11 +421,13 @@ app.post('/api/patients', auth, async (req, res) => {
         { new: true },
       );
       if (existing) {
+        await syncScheduleForPatient(existing);
         return res.status(200).json({ success: true, data: toClient(existing), deduped: true });
       }
     }
 
     const patient = await Patient.create(body);
+    await syncScheduleForPatient(patient);
     res.status(201).json({ success: true, data: toClient(patient) });
   } catch (err) {
     // E11000 here means a concurrent POST raced past the upsert check.
@@ -335,6 +461,7 @@ app.put('/api/patients/:id', auth, async (req, res) => {
     // doesn't match (someone else wrote first), return 409 with the
     // current server doc — client refetches + merges.
     const { version: clientVersion, ...updates } = req.body || {};
+    normalizeMchDates(updates);
     if (typeof clientVersion === 'number') {
       const filter = { _id: req.params.id, ashaId: req.user.id, version: clientVersion };
       const patient = await Patient.findOneAndUpdate(
@@ -351,6 +478,7 @@ app.put('/api/patients/:id', auth, async (req, res) => {
           current: toClient(current),
         });
       }
+      await syncScheduleForPatient(patient);
       return res.json({ success: true, data: toClient(patient) });
     }
     // Legacy path (no version) — increments anyway so older clients still cooperate.
@@ -360,6 +488,7 @@ app.put('/api/patients/:id', auth, async (req, res) => {
       { new: true }
     );
     if (!patient) return res.status(404).json({ success: false, message: 'Not found' });
+    await syncScheduleForPatient(patient);
     res.json({ success: true, data: toClient(patient) });
   } catch (err) {
     // Editing a patient's name+mobile to match another existing patient's
@@ -380,7 +509,65 @@ app.put('/api/patients/:id', auth, async (req, res) => {
 app.delete('/api/patients/:id', auth, async (req, res) => {
   try {
     await Patient.findOneAndDelete({ _id: req.params.id, ashaId: req.user.id });
+    await ScheduleEvent.deleteMany({ patientId: req.params.id, ashaId: req.user.id });
     res.json({ success: true });
+  } catch (err) {
+    res.status(500).json({ success: false, message: err.message });
+  }
+});
+
+// ── Schedule (ANC / immunization / HBNC due tracking) ─────────────────────────
+
+// Worker's "due / overdue" shortlist — the heart of the reminder workflow.
+// Returns pending events due within `withinDays` (default 14) OR already
+// overdue, soonest first. Optional `kind` filter (vaccine | anc | hbnc).
+app.get('/api/schedule/due', auth, async (req, res) => {
+  try {
+    const withinDays = Math.min(parseInt(req.query.withinDays, 10) || 14, 365);
+    const horizon = addDays(new Date(), withinDays);
+    const q = { ashaId: req.user.id, status: 'pending', dueDate: { $lte: horizon } };
+    if (req.query.kind) q.kind = req.query.kind;
+    const events = await ScheduleEvent.find(q).sort({ dueDate: 1 }).limit(500);
+    const now = new Date();
+    const data = events.map((e) => {
+      const o = toClient(e);
+      o.overdue = e.dueDate < now;
+      o.daysUntil = Math.round((e.dueDate - now) / DAY);
+      return o;
+    });
+    res.json({ success: true, data });
+  } catch (err) {
+    res.status(500).json({ success: false, message: err.message });
+  }
+});
+
+// Per-patient timeline (all events, any status), soonest first.
+app.get('/api/schedule', auth, async (req, res) => {
+  try {
+    const q = { ashaId: req.user.id };
+    if (req.query.patientId) q.patientId = req.query.patientId;
+    const events = await ScheduleEvent.find(q).sort({ dueDate: 1 }).limit(500);
+    res.json({ success: true, data: events.map(toClient) });
+  } catch (err) {
+    res.status(500).json({ success: false, message: err.message });
+  }
+});
+
+// Mark an event done / missed / skipped (worker tap on the shortlist).
+app.patch('/api/schedule/:id', auth, async (req, res) => {
+  try {
+    const { status, doneDate } = req.body || {};
+    const allowed = ['pending', 'done', 'missed', 'skipped'];
+    const set = {};
+    if (status && allowed.includes(status)) set.status = status;
+    if (status === 'done') set.doneDate = doneDate ? new Date(doneDate) : new Date();
+    const event = await ScheduleEvent.findOneAndUpdate(
+      { _id: req.params.id, ashaId: req.user.id },
+      { $set: set },
+      { new: true },
+    );
+    if (!event) return res.status(404).json({ success: false, message: 'Not found' });
+    res.json({ success: true, data: toClient(event) });
   } catch (err) {
     res.status(500).json({ success: false, message: err.message });
   }
