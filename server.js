@@ -430,8 +430,9 @@ app.get('/health', (_, res) => {
     success: true,
     message: 'AshaMitra backend is running',
     version: '1.0.0',
-    build: 'gemini-primary+lang-normalize+mch-schedule+reminders+ocr+remindlog+hbyc+aadhaarqr-2026-06',
+    build: 'gemini-primary+lang-normalize+mch-schedule+reminders+ocr+remindlog+hbyc+aadhaarqr2-2026-06',
     ocr: !!tesseract,
+    qr: !!(Jimp && jsQR), // Aadhaar QR engine loaded? (false ⇒ npm i jimp jsqr on VPS)
     chatPrimary: 'gemini', // resolveChatReply tries Gemini first, Groq fallback
     geminiKeys: (typeof geminiKeys !== 'undefined' && geminiKeys) ? geminiKeys.length : 0,
     db: {
@@ -834,16 +835,47 @@ function parseAadhaarQrString(s) {
   return null;
 }
 
+// Run jsQR over one prepared Jimp image (both polarities — Aadhaar QRs are
+// dark-on-light but phone glare / inversion can flip that).
+function _scanJimp(img) {
+  const { data, width, height } = img.bitmap; // RGBA
+  const code = jsQR(new Uint8ClampedArray(data), width, height,
+    { inversionAttempts: 'attemptBoth' });
+  return code && code.data ? code.data : null;
+}
+
+// Normalize a photo to a QR-locator-friendly size: a phone photo of the whole
+// card puts the QR in a small region, so we want enough resolution there
+// without making jsQR crawl over a 4000px frame. Target ~1600px on the long
+// edge (upscale tiny crops, downscale huge photos).
+function _fitForQr(img) {
+  const w = img.bitmap.width;
+  if (w < 900) img.scale(Math.min(3, Math.ceil(1600 / w)));
+  else if (w > 2200) img.scale(2200 / w);
+  return img;
+}
+
 async function decodeAadhaarQr(bytes) {
   if (!Jimp || !jsQR) return null;
   try {
-    const img = await Jimp.read(bytes);
-    // Upscale small images a bit to help the QR locator.
-    if (img.bitmap.width < 1000) img.scale(2);
-    const { data, width, height } = img.bitmap; // RGBA
-    const code = jsQR(new Uint8ClampedArray(data), width, height);
-    if (!code || !code.data) return null;
-    return parseAadhaarQrString(code.data);
+    const base = await Jimp.read(bytes);
+    // Try progressively-enhanced variants and stop at the first decode. QR
+    // locators are sensitive to size and contrast; a single pass on a raw
+    // full-card photo (glare, skew, JPEG noise) fails far too often.
+    const variants = [
+      (im) => _fitForQr(im),
+      (im) => _fitForQr(im).greyscale().normalize(),
+      (im) => _fitForQr(im).greyscale().contrast(0.35).normalize(),
+    ];
+    for (const make of variants) {
+      let s = null;
+      try { s = _scanJimp(make(base.clone())); } catch (_) { /* try next */ }
+      if (s) {
+        const parsed = parseAadhaarQrString(s);
+        if (parsed && parsed.name) return parsed;
+      }
+    }
+    return null;
   } catch (_) {
     return null;
   }
@@ -866,7 +898,18 @@ app.post('/api/ocr/aadhaar', auth, imageRawParser, async (req, res) => {
   try {
     fs.writeFileSync(tmp, req.body);
     const text = await tesseract.recognize(tmp, { lang: 'eng', oem: 1, psm: 3 });
-    res.json({ success: true, ...parseAadhaarText(text) });
+    const parsed = parseAadhaarText(text);
+    // Don't claim success on an empty read — that produced a green "filled"
+    // banner with no data. Require at least one usable field; otherwise tell
+    // the worker to re-shoot the QR (or type it).
+    if (!parsed.name && !parsed.aadhaar && !parsed.dob && !parsed.gender) {
+      return res.json({
+        success: false,
+        source: 'ocr',
+        message: 'QR না পড়ায় OCR করা হয়েছে, কিন্তু কিছু পড়া যায়নি — QR কোডটি স্পষ্ট করে আবার তুলুন।',
+      });
+    }
+    res.json({ success: true, ...parsed });
   } catch (e) {
     res.status(500).json({ success: false, message: e.message });
   } finally {
