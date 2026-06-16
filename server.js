@@ -213,7 +213,7 @@ const ANC_PLAN = [
 ];
 
 const VACCINE_PLAN = [
-  { code: 'V-BIRTH', label: 'জন্মের টিকা',          days: 0,    vaccines: ['BCG', 'OPV-0', 'Hepatitis B-0'] },
+  { code: 'V-BIRTH', label: 'জন্মের টিকা',          days: 0,    vaccines: ['BCG', 'OPV-0', 'Hepatitis B-0', 'Vitamin K'] },
   { code: 'V-6W',    label: '৬ সপ্তাহের টিকা',       days: 42,   vaccines: ['Pentavalent-1', 'OPV-1', 'Rotavirus-1', 'fIPV-1', 'PCV-1'] },
   { code: 'V-10W',   label: '১০ সপ্তাহের টিকা',      days: 70,   vaccines: ['Pentavalent-2', 'OPV-2', 'Rotavirus-2'] },
   { code: 'V-14W',   label: '১৪ সপ্তাহের টিকা',      days: 98,   vaccines: ['Pentavalent-3', 'OPV-3', 'Rotavirus-3', 'fIPV-2', 'PCV-2'] },
@@ -234,6 +234,16 @@ const HBNC_PLAN = [
   { code: 'HBNC-D42', label: 'গৃহ পরিদর্শন — ৪২তম দিন',  days: 42 },
 ];
 
+// Home-Based care for Young Child (HBYC / IIBYC card) — quarterly home visits
+// for growth, feeding, immunization-completeness and danger-sign screening.
+const HBYC_PLAN = [
+  { code: 'HBYC-3M',  label: 'গৃহভিত্তিক শিশু যত্ন — ৩ মাস',  days: 90 },
+  { code: 'HBYC-6M',  label: 'গৃহভিত্তিক শিশু যত্ন — ৬ মাস',  days: 180 },
+  { code: 'HBYC-9M',  label: 'গৃহভিত্তিক শিশু যত্ন — ৯ মাস',  days: 270 },
+  { code: 'HBYC-12M', label: 'গৃহভিত্তিক শিশু যত্ন — ১২ মাস', days: 365 },
+  { code: 'HBYC-15M', label: 'গৃহভিত্তিক শিশু যত্ন — ১৫ মাস', days: 455 },
+];
+
 // Re-sync a patient's schedule after create/update. Upserts each computed event
 // by (patientId, kind, code): dates/labels are refreshed in place, but an
 // event already marked done/missed keeps its status (only set on insert).
@@ -250,6 +260,7 @@ async function syncScheduleForPatient(p) {
     }
     if (p.dob) {
       for (const v of VACCINE_PLAN) planned.push({ kind: 'vaccine', code: v.code, label: v.label, dueDate: addDays(p.dob, v.days), meta: { vaccines: v.vaccines } });
+      for (const y of HBYC_PLAN) planned.push({ kind: 'hbyc', code: y.code, label: y.label, dueDate: addDays(p.dob, y.days), meta: {} });
       if (isNewborn) {
         for (const h of HBNC_PLAN) planned.push({ kind: 'hbnc', code: h.code, label: h.label, dueDate: addDays(p.dob, h.days), meta: {} });
       }
@@ -414,7 +425,7 @@ app.get('/health', (_, res) => {
     success: true,
     message: 'AshaMitra backend is running',
     version: '1.0.0',
-    build: 'gemini-primary+lang-normalize+mch-schedule+reminders+ocr+remindlog-2026-06',
+    build: 'gemini-primary+lang-normalize+mch-schedule+reminders+ocr+remindlog+hbyc-2026-06',
     ocr: !!tesseract,
     chatPrimary: 'gemini', // resolveChatReply tries Gemini first, Groq fallback
     geminiKeys: (typeof geminiKeys !== 'undefined' && geminiKeys) ? geminiKeys.length : 0,
