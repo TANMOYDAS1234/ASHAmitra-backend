@@ -231,6 +231,7 @@ const HBNC_PLAN = [
   { code: 'HBNC-D14', label: 'গৃহ পরিদর্শন — ১৪তম দিন',  days: 14 },
   { code: 'HBNC-D21', label: 'গৃহ পরিদর্শন — ২১তম দিন',  days: 21 },
   { code: 'HBNC-D28', label: 'গৃহ পরিদর্শন — ২৮তম দিন',  days: 28 },
+  { code: 'HBNC-D42', label: 'গৃহ পরিদর্শন — ৪২তম দিন',  days: 42 },
 ];
 
 // Re-sync a patient's schedule after create/update. Upserts each computed event
