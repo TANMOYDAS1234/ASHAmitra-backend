@@ -4,6 +4,13 @@ const mongoose = require('mongoose');
 const cors     = require('cors');
 const jwt      = require('jsonwebtoken');
 const crypto   = require('crypto');
+const fs       = require('fs');
+const os       = require('os');
+const path     = require('path');
+// Optional on-device-on-VPS OCR for Aadhaar autofill. Loaded lazily so the
+// server still boots if the package / tesseract binary isn't installed yet.
+let tesseract = null;
+try { tesseract = require('node-tesseract-ocr'); } catch (_) { /* install: npm i node-tesseract-ocr + apt install tesseract-ocr */ }
 
 const app = express();
 app.use(cors());
@@ -400,7 +407,8 @@ app.get('/health', (_, res) => {
     success: true,
     message: 'AshaMitra backend is running',
     version: '1.0.0',
-    build: 'gemini-primary+lang-normalize+mch-schedule+reminders-2026-06',
+    build: 'gemini-primary+lang-normalize+mch-schedule+reminders+ocr-2026-06',
+    ocr: !!tesseract,
     chatPrimary: 'gemini', // resolveChatReply tries Gemini first, Groq fallback
     geminiKeys: (typeof geminiKeys !== 'undefined' && geminiKeys) ? geminiKeys.length : 0,
     db: {
@@ -681,6 +689,58 @@ app.patch('/api/schedule/:id', auth, async (req, res) => {
     res.json({ success: true, data: toClient(event) });
   } catch (err) {
     res.status(500).json({ success: false, message: err.message });
+  }
+});
+
+// ── Aadhaar OCR (on-VPS, image discarded) ─────────────────────────────────────
+// The phone POSTs the Aadhaar photo bytes; we OCR them with Tesseract on this
+// server, parse name/DOB/gender + the MASKED number, and DELETE the image
+// immediately — nothing is stored (Aadhaar Act / data minimization). Returns
+// 503 if OCR isn't installed so the client falls back to manual entry.
+const imageRawParser = express.raw({ type: () => true, limit: '10mb' });
+
+function maskAadhaarServer(s) {
+  const d = (s || '').replace(/\D/g, '');
+  return d.length >= 4 ? `XXXX-XXXX-${d.slice(-4)}` : '';
+}
+
+function parseAadhaarText(text) {
+  const out = { name: null, dob: null, gender: null, aadhaar: null };
+  const a = text.match(/\b(\d{4}\s?\d{4}\s?\d{4})\b/);
+  if (a) out.aadhaar = maskAadhaarServer(a[1]);
+  const d = text.match(/(\d{2}[/-]\d{2}[/-]\d{4})/) ||
+            text.match(/year of birth\D*(\d{4})/i);
+  if (d) out.dob = d[1];
+  if (/female|মহিলা|महिला/i.test(text)) out.gender = 'Female';
+  else if (/\bmale\b|পুরুষ|पुरुष/i.test(text)) out.gender = 'Male';
+  const lines = text.split('\n').map((l) => l.trim()).filter(Boolean);
+  const di = lines.findIndex((l) => /\d{2}[/-]\d{2}[/-]\d{4}|year of birth/i.test(l));
+  if (di > 0) {
+    const c = lines[di - 1];
+    if (/^[A-Za-z][A-Za-z .]{2,}$/.test(c) && !/government|india|male|female/i.test(c)) {
+      out.name = c;
+    }
+  }
+  return out;
+}
+
+app.post('/api/ocr/aadhaar', auth, imageRawParser, async (req, res) => {
+  if (!tesseract) {
+    return res.status(503).json({ success: false, message: 'OCR not available on server' });
+  }
+  if (!req.body || !req.body.length) {
+    return res.status(400).json({ success: false, message: 'image required' });
+  }
+  const tmp = path.join(os.tmpdir(),
+      `aad_${Date.now()}_${Math.random().toString(36).slice(2)}.jpg`);
+  try {
+    fs.writeFileSync(tmp, req.body);
+    const text = await tesseract.recognize(tmp, { lang: 'eng', oem: 1, psm: 3 });
+    res.json({ success: true, ...parseAadhaarText(text) });
+  } catch (e) {
+    res.status(500).json({ success: false, message: e.message });
+  } finally {
+    try { fs.unlinkSync(tmp); } catch (_) {}
   }
 });
 
