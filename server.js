@@ -7,10 +7,15 @@ const crypto   = require('crypto');
 const fs       = require('fs');
 const os       = require('os');
 const path     = require('path');
+const zlib     = require('zlib');
 // Optional on-device-on-VPS OCR for Aadhaar autofill. Loaded lazily so the
 // server still boots if the package / tesseract binary isn't installed yet.
 let tesseract = null;
 try { tesseract = require('node-tesseract-ocr'); } catch (_) { /* install: npm i node-tesseract-ocr + apt install tesseract-ocr */ }
+// QR-based Aadhaar autofill (preferred — UIDAI-signed, far more accurate than
+// OCR). Lazy so the server boots even before `npm install jimp jsqr`.
+let Jimp = null, jsQR = null;
+try { Jimp = require('jimp'); jsQR = require('jsqr'); } catch (_) { /* install: npm i jimp jsqr */ }
 
 const app = express();
 app.use(cors());
@@ -425,7 +430,7 @@ app.get('/health', (_, res) => {
     success: true,
     message: 'AshaMitra backend is running',
     version: '1.0.0',
-    build: 'gemini-primary+lang-normalize+mch-schedule+reminders+ocr+remindlog+hbyc-2026-06',
+    build: 'gemini-primary+lang-normalize+mch-schedule+reminders+ocr+remindlog+hbyc+aadhaarqr-2026-06',
     ocr: !!tesseract,
     chatPrimary: 'gemini', // resolveChatReply tries Gemini first, Groq fallback
     geminiKeys: (typeof geminiKeys !== 'undefined' && geminiKeys) ? geminiKeys.length : 0,
@@ -732,11 +737,12 @@ app.post('/api/schedule/:id/remind', auth, async (req, res) => {
   }
 });
 
-// ── Aadhaar OCR (on-VPS, image discarded) ─────────────────────────────────────
-// The phone POSTs the Aadhaar photo bytes; we OCR them with Tesseract on this
-// server, parse name/DOB/gender + the MASKED number, and DELETE the image
-// immediately — nothing is stored (Aadhaar Act / data minimization). Returns
-// 503 if OCR isn't installed so the client falls back to manual entry.
+// ── Aadhaar autofill (on-VPS; image discarded, nothing stored) ────────────────
+// The phone POSTs the Aadhaar photo bytes. We FIRST try to decode the Secure QR
+// (UIDAI-signed → far more accurate, gives full demographics incl. address);
+// if no QR, we fall back to Tesseract text-OCR. The image is deleted / never
+// stored (Aadhaar Act / data minimization); only masked number + demographics
+// are returned.
 const imageRawParser = express.raw({ type: () => true, limit: '10mb' });
 
 function maskAadhaarServer(s) {
@@ -744,15 +750,16 @@ function maskAadhaarServer(s) {
   return d.length >= 4 ? `XXXX-XXXX-${d.slice(-4)}` : '';
 }
 
+// ---- Text-OCR fallback ----
 function parseAadhaarText(text) {
-  const out = { name: null, dob: null, gender: null, aadhaar: null };
+  const out = { source: 'ocr', name: null, dob: null, gender: null, aadhaar: null };
   const a = text.match(/\b(\d{4}\s?\d{4}\s?\d{4})\b/);
   if (a) out.aadhaar = maskAadhaarServer(a[1]);
   const d = text.match(/(\d{2}[/-]\d{2}[/-]\d{4})/) ||
             text.match(/year of birth\D*(\d{4})/i);
   if (d) out.dob = d[1];
   if (/female|মহিলা|महिला/i.test(text)) out.gender = 'Female';
-  else if (/\bmale\b|পুরুষ|पुरुष/i.test(text)) out.gender = 'Male';
+  else if (/\bmale\b|पुरुষ|पुरुष/i.test(text)) out.gender = 'Male';
   const lines = text.split('\n').map((l) => l.trim()).filter(Boolean);
   const di = lines.findIndex((l) => /\d{2}[/-]\d{2}[/-]\d{4}|year of birth/i.test(l));
   if (di > 0) {
@@ -764,12 +771,95 @@ function parseAadhaarText(text) {
   return out;
 }
 
-app.post('/api/ocr/aadhaar', auth, imageRawParser, async (req, res) => {
-  if (!tesseract) {
-    return res.status(503).json({ success: false, message: 'OCR not available on server' });
+// ---- QR decode (preferred) ----
+function _xmlAttr(s, k) { const m = s.match(new RegExp(`${k}="([^"]*)"`)); return m ? m[1] : ''; }
+
+// Older "PrintLetterBarcodeData" XML QR.
+function parseXmlAadhaar(s) {
+  const name = _xmlAttr(s, 'name');
+  if (!name) return null;
+  const g = _xmlAttr(s, 'gender');
+  const parts = ['house', 'street', 'lm', 'loc', 'vtc', 'po', 'subdist', 'dist', 'state', 'pc']
+    .map((k) => _xmlAttr(s, k)).filter(Boolean);
+  return {
+    source: 'qr',
+    name,
+    dob: _xmlAttr(s, 'dob') || _xmlAttr(s, 'yob'),
+    gender: g === 'F' ? 'Female' : g === 'M' ? 'Male' : null,
+    aadhaar: maskAadhaarServer(_xmlAttr(s, 'uid')),
+    address: parts.join(', '),
+    district: _xmlAttr(s, 'dist'),
+    pincode: _xmlAttr(s, 'pc'),
+    careOf: _xmlAttr(s, 'co'),
+  };
+}
+
+// Newer numeric "Secure QR" (big integer → [gzip] → 0xFF-delimited fields).
+function parseSecureAadhaar(s) {
+  try {
+    let n = BigInt(s);
+    const bytes = [];
+    while (n > 0n) { bytes.unshift(Number(n & 0xffn)); n >>= 8n; }
+    let data = Buffer.from(bytes);
+    try { data = zlib.gunzipSync(data); } catch (_) { /* v1: not gzipped */ }
+    const f = [];
+    let start = 0;
+    for (let i = 0; i < data.length && f.length < 16; i++) {
+      if (data[i] === 255) { f.push(data.slice(start, i).toString('utf8')); start = i + 1; }
+    }
+    if (f.length < 5 || !f[2]) return null;
+    const refId = f[1] || '', g = f[4] || '';
+    const last4 = refId.slice(0, 4);
+    const addr = [f[8], f[13], f[7], f[9], f[15], f[11], f[14], f[6], f[12], f[10]]
+      .filter(Boolean).join(', '); // house,street,landmark,loc,vtc,po,subdist,dist,state,pin
+    return {
+      source: 'qr',
+      name: f[2],
+      dob: f[3] || '',
+      gender: g === 'F' ? 'Female' : g === 'M' ? 'Male' : null,
+      aadhaar: /^\d{4}$/.test(last4) ? `XXXX-XXXX-${last4}` : '',
+      address: addr,
+      district: f[6] || '',
+      pincode: f[10] || '',
+      careOf: f[5] || '',
+    };
+  } catch (_) { return null; }
+}
+
+function parseAadhaarQrString(s) {
+  s = (s || '').trim();
+  if (!s) return null;
+  if (s.startsWith('<?xml') || s.includes('PrintLetterBarcodeData')) return parseXmlAadhaar(s);
+  if (/^\d+$/.test(s)) return parseSecureAadhaar(s);
+  return null;
+}
+
+async function decodeAadhaarQr(bytes) {
+  if (!Jimp || !jsQR) return null;
+  try {
+    const img = await Jimp.read(bytes);
+    // Upscale small images a bit to help the QR locator.
+    if (img.bitmap.width < 1000) img.scale(2);
+    const { data, width, height } = img.bitmap; // RGBA
+    const code = jsQR(new Uint8ClampedArray(data), width, height);
+    if (!code || !code.data) return null;
+    return parseAadhaarQrString(code.data);
+  } catch (_) {
+    return null;
   }
+}
+
+app.post('/api/ocr/aadhaar', auth, imageRawParser, async (req, res) => {
   if (!req.body || !req.body.length) {
     return res.status(400).json({ success: false, message: 'image required' });
+  }
+  // 1) Preferred: decode the Secure QR (signed, full demographics).
+  const qr = await decodeAadhaarQr(req.body);
+  if (qr && qr.name) return res.json({ success: true, ...qr });
+
+  // 2) Fallback: Tesseract text-OCR.
+  if (!tesseract) {
+    return res.json({ success: false, message: 'QR not found and OCR not available' });
   }
   const tmp = path.join(os.tmpdir(),
       `aad_${Date.now()}_${Math.random().toString(36).slice(2)}.jpg`);
