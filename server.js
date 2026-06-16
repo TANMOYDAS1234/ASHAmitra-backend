@@ -159,6 +159,12 @@ const scheduleEventSchema = new mongoose.Schema({
   // What the worker recorded when completing the visit: ANC vitals
   // (bp/weight/hb), vaccines actually given, danger-sign flags, free notes.
   record:        { type: mongoose.Schema.Types.Mixed, default: {} },
+  // Manual reminder log — the worker tapped Call / WhatsApp / SMS. Tracks that
+  // (and how) the patient was reminded, even for phone calls where there is no
+  // automatic trace. lastRemindedAt powers the "already reminded" hint.
+  reminderLog:         { type: Array,  default: [] }, // [{ channel, at }]
+  lastRemindedAt:      { type: Date,   default: null },
+  lastReminderChannel: { type: String, default: '' },  // call | whatsapp | sms
 }, { timestamps: true });
 scheduleEventSchema.index({ patientId: 1, kind: 1, code: 1 }, { unique: true });
 
@@ -407,7 +413,7 @@ app.get('/health', (_, res) => {
     success: true,
     message: 'AshaMitra backend is running',
     version: '1.0.0',
-    build: 'gemini-primary+lang-normalize+mch-schedule+reminders+ocr-2026-06',
+    build: 'gemini-primary+lang-normalize+mch-schedule+reminders+ocr+remindlog-2026-06',
     ocr: !!tesseract,
     chatPrimary: 'gemini', // resolveChatReply tries Gemini first, Groq fallback
     geminiKeys: (typeof geminiKeys !== 'undefined' && geminiKeys) ? geminiKeys.length : 0,
@@ -683,6 +689,28 @@ app.patch('/api/schedule/:id', auth, async (req, res) => {
     const event = await ScheduleEvent.findOneAndUpdate(
       { _id: req.params.id, ashaId: req.user.id },
       { $set: set },
+      { new: true },
+    );
+    if (!event) return res.status(404).json({ success: false, message: 'Not found' });
+    res.json({ success: true, data: toClient(event) });
+  } catch (err) {
+    res.status(500).json({ success: false, message: err.message });
+  }
+});
+
+// Log that the worker reminded the patient (Call / WhatsApp / SMS). Records the
+// channel + timestamp so a phone call is tracked just like an SMS/WhatsApp.
+app.post('/api/schedule/:id/remind', auth, async (req, res) => {
+  try {
+    const allowed = ['call', 'whatsapp', 'sms'];
+    const channel = allowed.includes((req.body || {}).channel) ? req.body.channel : 'call';
+    const at = new Date();
+    const event = await ScheduleEvent.findOneAndUpdate(
+      { _id: req.params.id, ashaId: req.user.id },
+      {
+        $push: { reminderLog: { channel, at } },
+        $set: { lastRemindedAt: at, lastReminderChannel: channel },
+      },
       { new: true },
     );
     if (!event) return res.status(404).json({ success: false, message: 'Not found' });
