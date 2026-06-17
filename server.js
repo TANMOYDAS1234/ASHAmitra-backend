@@ -47,6 +47,11 @@ const patientSchema = new mongoose.Schema({
   type:      { type: String, required: true },
   village:   { type: String, default: '' },
   mobile:    { type: String, default: '' },
+  // Demographics — REQUIRED in the schema or Mongoose strips them on save
+  // (strict mode), losing them on every server round-trip / syncFromServer.
+  age:       { type: String, default: '' },
+  ageUnit:   { type: String, default: 'years' },
+  gender:    { type: String, default: '' },
   lastVisit: { type: String, default: '' },
   risk:      { type: String, default: 'safe' },
   situation: String,
@@ -430,7 +435,7 @@ app.get('/health', (_, res) => {
     success: true,
     message: 'AshaMitra backend is running',
     version: '1.0.0',
-    build: 'gemini-primary+lang-normalize+mch-schedule+reminders+ocr+remindlog+hbyc+aadhaarqr2+patientversionfix-2026-06',
+    build: 'gemini-primary+lang-normalize+mch-schedule+reminders+ocr+remindlog+hbyc+aadhaarqr2+patientversionfix+agegenderfix-2026-06',
     ocr: !!tesseract,
     qr: !!(Jimp && jsQR), // Aadhaar QR engine loaded? (false ⇒ npm i jimp jsqr on VPS)
     chatPrimary: 'gemini', // resolveChatReply tries Gemini first, Groq fallback
