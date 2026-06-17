@@ -430,7 +430,7 @@ app.get('/health', (_, res) => {
     success: true,
     message: 'AshaMitra backend is running',
     version: '1.0.0',
-    build: 'gemini-primary+lang-normalize+mch-schedule+reminders+ocr+remindlog+hbyc+aadhaarqr2-2026-06',
+    build: 'gemini-primary+lang-normalize+mch-schedule+reminders+ocr+remindlog+hbyc+aadhaarqr2+patientversionfix-2026-06',
     ocr: !!tesseract,
     qr: !!(Jimp && jsQR), // Aadhaar QR engine loaded? (false ⇒ npm i jimp jsqr on VPS)
     chatPrimary: 'gemini', // resolveChatReply tries Gemini first, Groq fallback
@@ -543,6 +543,13 @@ app.get('/api/patients', auth, async (req, res) => {
 app.post('/api/patients', auth, async (req, res) => {
   try {
     const body = { ...req.body, ashaId: req.user.id };
+    // Strip client-managed/immutable keys: `version` must be touched ONLY by
+    // `$inc` below (otherwise Mongo errors "Updating the path 'version' would
+    // create a conflict at 'version'"), and `_id`/`id` must never be $set on an
+    // existing doc.
+    delete body.version;
+    delete body._id;
+    delete body.id;
     normalizeMchDates(body);
     const name = (body.name || '').trim();
     const mobile = (body.mobile || '').trim();
@@ -608,7 +615,7 @@ app.put('/api/patients/:id', auth, async (req, res) => {
       const filter = { _id: req.params.id, ashaId: req.user.id, version: clientVersion };
       const patient = await Patient.findOneAndUpdate(
         filter,
-        { ...updates, $inc: { version: 1 } },
+        { $set: updates, $inc: { version: 1 } },
         { new: true },
       );
       if (!patient) {
@@ -626,7 +633,7 @@ app.put('/api/patients/:id', auth, async (req, res) => {
     // Legacy path (no version) — increments anyway so older clients still cooperate.
     const patient = await Patient.findOneAndUpdate(
       { _id: req.params.id, ashaId: req.user.id },
-      { ...updates, $inc: { version: 1 } },
+      { $set: updates, $inc: { version: 1 } },
       { new: true }
     );
     if (!patient) return res.status(404).json({ success: false, message: 'Not found' });
