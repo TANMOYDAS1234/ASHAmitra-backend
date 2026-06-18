@@ -435,7 +435,7 @@ app.get('/health', (_, res) => {
     success: true,
     message: 'AshaMitra backend is running',
     version: '1.0.0',
-    build: 'gemini-primary+lang-normalize+mch-schedule+reminders+ocr+remindlog+hbyc+aadhaarqr2+patientversionfix+agegenderfix-2026-06',
+    build: 'gemini-primary+lang-normalize+mch-schedule+reminders+ocr+remindlog+hbyc+aadhaarqr2+patientversionfix+agegenderfix+editlegacyversionfix-2026-06',
     ocr: !!tesseract,
     qr: !!(Jimp && jsQR), // Aadhaar QR engine loaded? (false ⇒ npm i jimp jsqr on VPS)
     chatPrimary: 'gemini', // resolveChatReply tries Gemini first, Groq fallback
@@ -617,7 +617,15 @@ app.put('/api/patients/:id', auth, async (req, res) => {
     const { version: clientVersion, ...updates } = req.body || {};
     normalizeMchDates(updates);
     if (typeof clientVersion === 'number') {
-      const filter = { _id: req.params.id, ashaId: req.user.id, version: clientVersion };
+      // Match the expected version OR a doc with no version yet — legacy rows
+      // (created before the version field existed) have `version` ABSENT, and
+      // in Mongo {version: 0} does NOT match a missing field, which 409'd every
+      // edit of those patients. $in [clientVersion, null] also matches absent.
+      const filter = {
+        _id: req.params.id,
+        ashaId: req.user.id,
+        version: { $in: [clientVersion, null] },
+      };
       const patient = await Patient.findOneAndUpdate(
         filter,
         { $set: updates, $inc: { version: 1 } },
