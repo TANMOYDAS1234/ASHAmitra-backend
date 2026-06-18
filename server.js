@@ -79,12 +79,29 @@ const patientSchema = new mongoose.Schema({
   // masked Aadhaar, etc. Kept as a flexible map (all optional) rather than ~27
   // columns; the registration form drives the keys.
   mcpDetails:    { type: mongoose.Schema.Types.Mixed, default: {} },
+  // ── Identity / de-dup keys ───────────────────────────────────────────────
+  // clientId = the client-generated local id (e.g. "p_169…"). Idempotency key:
+  // a retried / re-synced POST of the SAME local record matches here and updates
+  // in place instead of creating a duplicate. This is what makes the offline-
+  // first sync safe now that we no longer silently merge on name+mobile (two
+  // real people can share a name and a household phone — see rchId below).
+  clientId:      { type: String, default: '' },
+  // rchId = the RCH/MCTS government registration number ("Egiya Bangla Portal
+  // ID") — the canonical real-world person key, mirrored from mcpDetails.rchId.
+  // When present it identifies the same person even across re-registration.
+  rchId:         { type: String, default: '' },
   // Optimistic concurrency control. Incremented on every successful update.
   // PUT requests carry the version they're updating from; if it no longer
   // matches the server's, the update is rejected 409 so the client can
   // refetch + merge instead of silently overwriting another writer.
   version:   { type: Number, default: 0 },
 }, { timestamps: true });
+
+// De-dup lookup indexes (non-unique — two real people CAN share a name+phone,
+// so uniqueness is decided by the client-side "possible duplicate?" prompt, not
+// the DB). These two just make the idempotency/strong-key lookups in POST fast.
+patientSchema.index({ ashaId: 1, clientId: 1 });
+patientSchema.index({ ashaId: 1, rchId: 1 });
 
 const reportSchema = new mongoose.Schema({
   ashaId:              { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true },
@@ -305,6 +322,18 @@ function normalizeMchDates(body) {
   return body;
 }
 
+// Mirror the RCH/MCTS id from the flexible mcpDetails map into the top-level
+// indexed `rchId` field so the strong-key de-dup lookup can use an index. The
+// registration form only writes mcpDetails.rchId; this keeps one source of
+// truth while still giving us a fast, indexable key.
+function mirrorRchId(body) {
+  if (!body) return body;
+  const fromMcp = body.mcpDetails && body.mcpDetails.rchId;
+  const v = String((fromMcp != null ? fromMcp : body.rchId) || '').trim();
+  if (v) body.rchId = v;
+  return body;
+}
+
 // ── Automatic reminder engine ─────────────────────────────────────────────────
 // A lightweight in-process scheduler (no extra dependency) scans pending
 // schedule events and fires reminders at three lead-times — 3 days before,
@@ -439,7 +468,7 @@ app.get('/health', (_, res) => {
     success: true,
     message: 'AshaMitra backend is running',
     version: '1.0.0',
-    build: 'gemini-primary+lang-normalize+mch-schedule+reminders+ocr+remindlog+hbyc+aadhaarqr2+patientversionfix+agegenderfix+editlegacyversionfix+dobschedguard-2026-06',
+    build: 'gemini-primary+lang-normalize+mch-schedule+reminders+ocr+remindlog+hbyc+aadhaarqr2+patientversionfix+agegenderfix+editlegacyversionfix+dobschedguard+identitydedup-2026-06',
     ocr: !!tesseract,
     qr: !!(Jimp && jsQR), // Aadhaar QR engine loaded? (false ⇒ npm i jimp jsqr on VPS)
     chatPrimary: 'gemini', // resolveChatReply tries Gemini first, Groq fallback
@@ -552,27 +581,35 @@ app.get('/api/patients', auth, async (req, res) => {
 app.post('/api/patients', auth, async (req, res) => {
   try {
     const body = { ...req.body, ashaId: req.user.id };
-    // Strip client-managed/immutable keys: `version` must be touched ONLY by
-    // `$inc` below (otherwise Mongo errors "Updating the path 'version' would
-    // create a conflict at 'version'"), and `_id`/`id` must never be $set on an
-    // existing doc.
+    // Capture the client-generated local id as the idempotency key BEFORE we
+    // strip it. `version` must be touched ONLY by `$inc` below (else Mongo
+    // errors "Updating the path 'version' would create a conflict"), and
+    // `_id`/`id` must never be $set on an existing doc.
+    const clientId = String(body.clientId || body.id || '').trim();
     delete body.version;
     delete body._id;
     delete body.id;
+    if (clientId) body.clientId = clientId;
     normalizeMchDates(body);
-    const name = (body.name || '').trim();
-    const mobile = (body.mobile || '').trim();
+    mirrorRchId(body);
 
-    // De-dup: if a patient already exists for this ASHA with the same name +
-    // mobile, return that existing doc instead of creating a new one.
-    // This prevents duplicates from accidental double-taps, retry on flaky
-    // network, or the user adding the same person twice. The client
-    // receives the existing _id, so subsequent triage reports correctly
-    // attach to the original patient document.
-    if (name) {
-      const match = mobile
-        ? { ashaId: req.user.id, name, mobile }
-        : { ashaId: req.user.id, name, mobile: { $in: ['', null] } };
+    // ── De-dup, in priority order ────────────────────────────────────────────
+    // We deliberately do NOT merge on name+mobile: two real people can share a
+    // name and a household phone, and a child often has neither Aadhaar nor a
+    // phone — so a name+mobile merge silently loses a beneficiary. Instead the
+    // client surfaces a "possible duplicate?" prompt to the worker (who knows
+    // the family). The server only merges on UNAMBIGUOUS keys:
+    //
+    //   1. clientId — the SAME local record being retried / re-synced. Makes
+    //      offline-first POST idempotent (no dupes from double-tap, flaky
+    //      network, or a slow-but-successful POST that the client re-queues).
+    //   2. rchId — the government RCH/MCTS id: the same real person, even if
+    //      re-registered as a fresh local record on another device.
+    for (const match of [
+      clientId   ? { ashaId: req.user.id, clientId } : null,
+      body.rchId ? { ashaId: req.user.id, rchId: body.rchId } : null,
+    ]) {
+      if (!match) continue;
       const existing = await Patient.findOneAndUpdate(
         match,
         { $set: body, $inc: { version: 1 } },
@@ -588,15 +625,6 @@ app.post('/api/patients', auth, async (req, res) => {
     await syncScheduleForPatient(patient);
     res.status(201).json({ success: true, data: toClient(patient) });
   } catch (err) {
-    // E11000 here means a concurrent POST raced past the upsert check.
-    // Friendly 409 so the client can show "patient already exists".
-    if (err && err.code === 11000) {
-      return res.status(409).json({
-        success: false,
-        code: 'DUPLICATE_NAME_MOBILE',
-        message: 'A patient with this name and mobile number already exists in your list.',
-      });
-    }
     res.status(500).json({ success: false, message: err.message });
   }
 });
@@ -619,7 +647,9 @@ app.put('/api/patients/:id', auth, async (req, res) => {
     // doesn't match (someone else wrote first), return 409 with the
     // current server doc — client refetches + merges.
     const { version: clientVersion, ...updates } = req.body || {};
+    delete updates.clientId; // never overwrite the idempotency key on edit
     normalizeMchDates(updates);
+    mirrorRchId(updates); // keep top-level rchId in sync when the worker edits it
     if (typeof clientVersion === 'number') {
       // Match the expected version OR a doc with no version yet — legacy rows
       // (created before the version field existed) have `version` ABSENT, and
