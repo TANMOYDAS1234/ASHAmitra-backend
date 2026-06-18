@@ -263,12 +263,16 @@ async function syncScheduleForPatient(p) {
     const type = (p.type || '').toLowerCase();
     const isPregnancy = type.includes('preg') || type.includes('গর্ভ');
     const isNewborn   = type.includes('newborn') || type.includes('নবজাত');
+    const isChild     = type.includes('child') || type.includes('infant') || type.includes('শিশু');
 
     const planned = [];
     if (p.lmp && isPregnancy) {
       for (const a of ANC_PLAN) planned.push({ kind: 'anc', code: a.code, label: a.label, dueDate: addDays(p.lmp, a.weeks * 7), meta: {} });
     }
-    if (p.dob) {
+    // ONLY a child/newborn DOB drives the vaccine/HBNC schedule. A DOB stored on
+    // a mother (pregnancy) or 'other' patient is just a record — it must never
+    // generate baby-vaccine reminders for an adult.
+    if (p.dob && (isNewborn || isChild)) {
       for (const v of VACCINE_PLAN) planned.push({ kind: 'vaccine', code: v.code, label: v.label, dueDate: addDays(p.dob, v.days), meta: { vaccines: v.vaccines } });
       for (const y of HBYC_PLAN) planned.push({ kind: 'hbyc', code: y.code, label: y.label, dueDate: addDays(p.dob, y.days), meta: {} });
       if (isNewborn) {
@@ -435,7 +439,7 @@ app.get('/health', (_, res) => {
     success: true,
     message: 'AshaMitra backend is running',
     version: '1.0.0',
-    build: 'gemini-primary+lang-normalize+mch-schedule+reminders+ocr+remindlog+hbyc+aadhaarqr2+patientversionfix+agegenderfix+editlegacyversionfix-2026-06',
+    build: 'gemini-primary+lang-normalize+mch-schedule+reminders+ocr+remindlog+hbyc+aadhaarqr2+patientversionfix+agegenderfix+editlegacyversionfix+dobschedguard-2026-06',
     ocr: !!tesseract,
     qr: !!(Jimp && jsQR), // Aadhaar QR engine loaded? (false ⇒ npm i jimp jsqr on VPS)
     chatPrimary: 'gemini', // resolveChatReply tries Gemini first, Groq fallback
