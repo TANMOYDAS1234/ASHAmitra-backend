@@ -195,12 +195,49 @@ const scheduleEventSchema = new mongoose.Schema({
 }, { timestamps: true });
 scheduleEventSchema.index({ patientId: 1, kind: 1, code: 1 }, { unique: true });
 
+// ── Referrals (ASHA Form 3) ───────────────────────────────────────────────────
+// A referral the worker makes to a facility (FRU/PHC/RH). Mirrors the paper
+// "Form 3" but adds OUTCOME TRACKING — the #1 missing piece field workers asked
+// for: today a patient vanishes once she leaves the sub-centre. status moves
+// pending → reached → completed (or cancelled); the worker records who admitted
+// her + the outcome when known. clientId makes the create idempotent offline.
+const referralSchema = new mongoose.Schema({
+  ashaId:        { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true, index: true },
+  clientId:      { type: String, default: '' },
+  patientId:     { type: String, default: '' },
+  patientName:   { type: String, default: '' },
+  age:           { type: String, default: '' },
+  gender:        { type: String, default: '' },
+  guardianName:  { type: String, default: '' },
+  village:       { type: String, default: '' },
+  mobile:        { type: String, default: '' },
+  caseType:      { type: String, default: '' },     // pregnancy | newborn | child | other
+  symptoms:      { type: String, default: '' },     // illness / danger signs
+  currentWeight: { type: String, default: '' },     // child (Form 3)
+  imnci:         { type: String, default: '' },     // IMNCI classification (child)
+  medicinesGiven:{ type: String, default: '' },
+  referredTo:    { type: String, default: '' },     // facility referred to
+  reason:        { type: String, default: '' },     // why (band / danger summary)
+  band:          { type: String, default: '' },     // RED | YELLOW
+  status:        { type: String, default: 'pending', index: true }, // pending|reached|completed|cancelled
+  reachedDate:   { type: Date,   default: null },
+  admittedBy:    { type: String, default: '' },     // who took/admitted her
+  relation:      { type: String, default: '' },
+  facilityNotes: { type: String, default: '' },
+  outcome:       { type: String, default: '' },     // admitted / treated & sent home / referred up / ...
+  // Optimistic concurrency (same scheme as Patient): client sends the version
+  // it edited from; the server only writes if it still matches, else 409.
+  version:       { type: Number, default: 0 },
+}, { timestamps: true });
+referralSchema.index({ ashaId: 1, clientId: 1 });
+
 const User          = mongoose.model('User',          userSchema);
 const Patient       = mongoose.model('Patient',       patientSchema);
 const Report        = mongoose.model('Report',        reportSchema);
 const Notification  = mongoose.model('Notification',  notificationSchema);
 const AiCache       = mongoose.model('AiCache',       aiCacheSchema);
 const ScheduleEvent = mongoose.model('ScheduleEvent', scheduleEventSchema);
+const Referral      = mongoose.model('Referral',      referralSchema);
 
 // ── Helper: create one notification per active admin ──────────────────────────
 async function notifyAllAdmins({ type, title, body, link = '', data = {} }) {
@@ -468,7 +505,7 @@ app.get('/health', (_, res) => {
     success: true,
     message: 'AshaMitra backend is running',
     version: '1.0.0',
-    build: 'gemini-primary+lang-normalize+mch-schedule+reminders+ocr+remindlog+hbyc+aadhaarqr2+patientversionfix+agegenderfix+editlegacyversionfix+dobschedguard+identitydedup-2026-06',
+    build: 'gemini-primary+lang-normalize+mch-schedule+reminders+ocr+remindlog+hbyc+aadhaarqr2+patientversionfix+agegenderfix+editlegacyversionfix+dobschedguard+identitydedup+referrals-2026-06',
     ocr: !!tesseract,
     qr: !!(Jimp && jsQR), // Aadhaar QR engine loaded? (false ⇒ npm i jimp jsqr on VPS)
     chatPrimary: 'gemini', // resolveChatReply tries Gemini first, Groq fallback
@@ -706,6 +743,99 @@ app.delete('/api/patients/:id', auth, async (req, res) => {
   try {
     await Patient.findOneAndDelete({ _id: req.params.id, ashaId: req.user.id });
     await ScheduleEvent.deleteMany({ patientId: req.params.id, ashaId: req.user.id });
+    res.json({ success: true });
+  } catch (err) {
+    res.status(500).json({ success: false, message: err.message });
+  }
+});
+
+// ── Referrals (ASHA Form 3 + outcome tracking) ────────────────────────────────
+// Same offline-first contract as patients: clientId makes create idempotent,
+// `version` gives optimistic-concurrency on edit (so two devices updating the
+// same referral don't silently clobber each other).
+
+// List the worker's referrals, newest first.
+app.get('/api/referrals', auth, async (req, res) => {
+  try {
+    const referrals = await Referral.find({ ashaId: req.user.id }).sort({ createdAt: -1 }).limit(1000);
+    res.json({ success: true, data: referrals.map(toClient) });
+  } catch (err) {
+    res.status(500).json({ success: false, message: err.message });
+  }
+});
+
+// Create a referral. De-dups on clientId so an offline-queued create that is
+// retried (double-tap / flaky network) updates the same row instead of duping.
+app.post('/api/referrals', auth, async (req, res) => {
+  try {
+    const body = { ...req.body, ashaId: req.user.id };
+    const clientId = String(body.clientId || body.id || '').trim();
+    delete body.version;
+    delete body._id;
+    delete body.id;
+    if (clientId) body.clientId = clientId;
+
+    if (clientId) {
+      const existing = await Referral.findOneAndUpdate(
+        { ashaId: req.user.id, clientId },
+        { $set: body, $inc: { version: 1 } },
+        { new: true },
+      );
+      if (existing) {
+        return res.status(200).json({ success: true, data: toClient(existing), deduped: true });
+      }
+    }
+
+    const referral = await Referral.create(body);
+    res.status(201).json({ success: true, data: toClient(referral) });
+  } catch (err) {
+    res.status(500).json({ success: false, message: err.message });
+  }
+});
+
+// Update a referral — typically the OUTCOME (status reached/completed, who
+// admitted her, facility notes). Optimistic concurrency mirrors patients.
+app.put('/api/referrals/:id', auth, async (req, res) => {
+  try {
+    const { version: clientVersion, ...updates } = req.body || {};
+    delete updates.clientId; // never overwrite the idempotency key on edit
+    if (typeof clientVersion === 'number') {
+      const filter = {
+        _id: req.params.id,
+        ashaId: req.user.id,
+        version: { $in: [clientVersion, null] }, // null matches legacy rows
+      };
+      const referral = await Referral.findOneAndUpdate(
+        filter,
+        { $set: updates, $inc: { version: 1 } },
+        { new: true },
+      );
+      if (!referral) {
+        const current = await Referral.findOne({ _id: req.params.id, ashaId: req.user.id });
+        if (!current) return res.status(404).json({ success: false, message: 'Not found' });
+        return res.status(409).json({
+          success: false,
+          message: 'Version conflict — referral was modified by another writer.',
+          current: toClient(current),
+        });
+      }
+      return res.json({ success: true, data: toClient(referral) });
+    }
+    const referral = await Referral.findOneAndUpdate(
+      { _id: req.params.id, ashaId: req.user.id },
+      { $set: updates, $inc: { version: 1 } },
+      { new: true },
+    );
+    if (!referral) return res.status(404).json({ success: false, message: 'Not found' });
+    res.json({ success: true, data: toClient(referral) });
+  } catch (err) {
+    res.status(500).json({ success: false, message: err.message });
+  }
+});
+
+app.delete('/api/referrals/:id', auth, async (req, res) => {
+  try {
+    await Referral.findOneAndDelete({ _id: req.params.id, ashaId: req.user.id });
     res.json({ success: true });
   } catch (err) {
     res.status(500).json({ success: false, message: err.message });
