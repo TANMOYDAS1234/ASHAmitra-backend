@@ -232,6 +232,72 @@ const referralSchema = new mongoose.Schema({
 }, { timestamps: true });
 referralSchema.index({ ashaId: 1, clientId: 1 });
 
+// ── Eligible couples (family-planning register) ───────────────────────────────
+// An "eligible couple" = a married couple with the wife in the reproductive age
+// band (15–49). ASHAs maintain this register to counsel + track contraceptive
+// use and do FP follow-ups. Mirrors the paper Eligible-Couple register but adds
+// the current method + next follow-up so the reminder engine can surface it.
+const eligibleCoupleSchema = new mongoose.Schema({
+  ashaId:        { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true, index: true },
+  clientId:      { type: String, default: '' },
+  patientId:     { type: String, default: '' },     // optional link to a Patient (the wife)
+  wifeName:      { type: String, default: '' },
+  husbandName:   { type: String, default: '' },
+  wifeAge:       { type: String, default: '' },
+  husbandAge:    { type: String, default: '' },
+  village:       { type: String, default: '' },
+  mobile:        { type: String, default: '' },
+  marriageDate:  { type: Date,   default: null },
+  sons:          { type: String, default: '' },     // living sons
+  daughters:     { type: String, default: '' },     // living daughters
+  youngestChildAge: { type: String, default: '' },  // months/years (free text)
+  fpMethod:      { type: String, default: 'none' }, // none|condom|ocp|iucd|injectable|female_sterilization|male_sterilization|other
+  fpAdoptedDate: { type: Date,   default: null },
+  followUpDate:  { type: Date,   default: null, index: true }, // next FP follow-up
+  highRisk:      { type: Boolean, default: false },
+  notes:         { type: String, default: '' },
+  status:        { type: String, default: 'active', index: true }, // active|closed
+  version:       { type: Number, default: 0 },
+}, { timestamps: true });
+eligibleCoupleSchema.index({ ashaId: 1, clientId: 1 });
+
+// ── Vital events (birth & death register, CRS reporting) ──────────────────────
+// Births and deaths the ASHA reports to the ANM/sub-centre each month for civil
+// registration (CRS). One schema covers both via `eventType`; only the relevant
+// fields are filled. Tracks whether it was registered (CRS number) so the worker
+// knows what is still pending registration.
+const vitalEventSchema = new mongoose.Schema({
+  ashaId:        { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true, index: true },
+  clientId:      { type: String, default: '' },
+  patientId:     { type: String, default: '' },     // optional link to a Patient
+  eventType:     { type: String, default: 'birth', index: true }, // birth|death
+  // Common
+  personName:    { type: String, default: '' },     // newborn / deceased (may be blank for a birth)
+  sex:           { type: String, default: '' },      // Male|Female|Other
+  eventDate:     { type: Date,   default: null, index: true }, // DOB or DOD
+  place:         { type: String, default: '' },      // home|institution|transit|other
+  facilityName:  { type: String, default: '' },
+  village:       { type: String, default: '' },
+  mobile:        { type: String, default: '' },
+  motherName:    { type: String, default: '' },
+  fatherName:    { type: String, default: '' },
+  // Birth-specific
+  birthWeight:   { type: String, default: '' },      // kg
+  deliveryType:  { type: String, default: '' },      // normal|caesarean|assisted
+  attendedBy:    { type: String, default: '' },      // doctor|anm|sba|tba|relative
+  // Death-specific
+  ageAtDeath:    { type: String, default: '' },      // free text (e.g. "32 বছর", "5 দিন")
+  causeOfDeath:  { type: String, default: '' },
+  maternalDeath: { type: Boolean, default: false },  // death during pregnancy/childbirth/42d
+  infantDeath:   { type: Boolean, default: false },  // <1 year
+  // Registration tracking
+  registered:    { type: Boolean, default: false },
+  registrationNo:{ type: String, default: '' },
+  notes:         { type: String, default: '' },
+  version:       { type: Number, default: 0 },
+}, { timestamps: true });
+vitalEventSchema.index({ ashaId: 1, clientId: 1 });
+
 const User          = mongoose.model('User',          userSchema);
 const Patient       = mongoose.model('Patient',       patientSchema);
 const Report        = mongoose.model('Report',        reportSchema);
@@ -239,6 +305,8 @@ const Notification  = mongoose.model('Notification',  notificationSchema);
 const AiCache       = mongoose.model('AiCache',       aiCacheSchema);
 const ScheduleEvent = mongoose.model('ScheduleEvent', scheduleEventSchema);
 const Referral      = mongoose.model('Referral',      referralSchema);
+const EligibleCouple= mongoose.model('EligibleCouple',eligibleCoupleSchema);
+const VitalEvent    = mongoose.model('VitalEvent',    vitalEventSchema);
 
 // ── Helper: create one notification per active admin ──────────────────────────
 async function notifyAllAdmins({ type, title, body, link = '', data = {} }) {
@@ -536,7 +604,7 @@ app.get('/health', (_, res) => {
     success: true,
     message: 'AshaMitra backend is running',
     version: '1.0.0',
-    build: 'gemini-primary+lang-normalize+mch-schedule+reminders+ocr+remindlog+hbyc+aadhaarqr2+patientversionfix+agegenderfix+editlegacyversionfix+dobschedguard+identitydedup+referrals+pncschedule+watemplate-2026-06',
+    build: 'gemini-primary+lang-normalize+mch-schedule+reminders+ocr+remindlog+hbyc+aadhaarqr2+patientversionfix+agegenderfix+editlegacyversionfix+dobschedguard+identitydedup+referrals+pncschedule+watemplate+eligiblecouples+vitalevents-2026-06',
     ocr: !!tesseract,
     qr: !!(Jimp && jsQR), // Aadhaar QR engine loaded? (false ⇒ npm i jimp jsqr on VPS)
     chatPrimary: 'gemini', // resolveChatReply tries Gemini first, Groq fallback
@@ -872,6 +940,98 @@ app.delete('/api/referrals/:id', auth, async (req, res) => {
     res.status(500).json({ success: false, message: err.message });
   }
 });
+
+// ── Generic owner-scoped CRUD for the simple sync'd collections ────────────────
+// EligibleCouple + VitalEvent share the exact offline-first contract used by
+// referrals (clientId de-dup on create, optimistic version on update). This
+// factory wires GET/POST/PUT/DELETE for a model so both modules stay identical
+// to the proven referral path.
+function registerSyncedCrud(path, Model) {
+  app.get(`/api/${path}`, auth, async (req, res) => {
+    try {
+      const docs = await Model.find({ ashaId: req.user.id }).sort({ createdAt: -1 }).limit(2000);
+      res.json({ success: true, data: docs.map(toClient) });
+    } catch (err) {
+      res.status(500).json({ success: false, message: err.message });
+    }
+  });
+
+  app.post(`/api/${path}`, auth, async (req, res) => {
+    try {
+      const body = { ...req.body, ashaId: req.user.id };
+      const clientId = String(body.clientId || body.id || '').trim();
+      delete body.version;
+      delete body._id;
+      delete body.id;
+      if (clientId) body.clientId = clientId;
+
+      if (clientId) {
+        const existing = await Model.findOneAndUpdate(
+          { ashaId: req.user.id, clientId },
+          { $set: body, $inc: { version: 1 } },
+          { new: true },
+        );
+        if (existing) {
+          return res.status(200).json({ success: true, data: toClient(existing), deduped: true });
+        }
+      }
+      const doc = await Model.create(body);
+      res.status(201).json({ success: true, data: toClient(doc) });
+    } catch (err) {
+      res.status(500).json({ success: false, message: err.message });
+    }
+  });
+
+  app.put(`/api/${path}/:id`, auth, async (req, res) => {
+    try {
+      const { version: clientVersion, ...updates } = req.body || {};
+      delete updates.clientId;
+      if (typeof clientVersion === 'number') {
+        const filter = {
+          _id: req.params.id,
+          ashaId: req.user.id,
+          version: { $in: [clientVersion, null] },
+        };
+        const doc = await Model.findOneAndUpdate(
+          filter,
+          { $set: updates, $inc: { version: 1 } },
+          { new: true },
+        );
+        if (!doc) {
+          const current = await Model.findOne({ _id: req.params.id, ashaId: req.user.id });
+          if (!current) return res.status(404).json({ success: false, message: 'Not found' });
+          return res.status(409).json({
+            success: false,
+            message: 'Version conflict — modified by another writer.',
+            current: toClient(current),
+          });
+        }
+        return res.json({ success: true, data: toClient(doc) });
+      }
+      const doc = await Model.findOneAndUpdate(
+        { _id: req.params.id, ashaId: req.user.id },
+        { $set: updates, $inc: { version: 1 } },
+        { new: true },
+      );
+      if (!doc) return res.status(404).json({ success: false, message: 'Not found' });
+      res.json({ success: true, data: toClient(doc) });
+    } catch (err) {
+      res.status(500).json({ success: false, message: err.message });
+    }
+  });
+
+  app.delete(`/api/${path}/:id`, auth, async (req, res) => {
+    try {
+      await Model.findOneAndDelete({ _id: req.params.id, ashaId: req.user.id });
+      res.json({ success: true });
+    } catch (err) {
+      res.status(500).json({ success: false, message: err.message });
+    }
+  });
+}
+
+registerSyncedCrud('eligible-couples', EligibleCouple);
+registerSyncedCrud('vital-events', VitalEvent);
 
 // ── Schedule (ANC / immunization / HBNC due tracking) ─────────────────────────
 
