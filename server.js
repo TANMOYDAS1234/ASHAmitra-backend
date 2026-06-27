@@ -243,6 +243,8 @@ const eligibleCoupleSchema = new mongoose.Schema({
   patientId:     { type: String, default: '' },     // optional link to a Patient (the wife)
   wifeName:      { type: String, default: '' },
   husbandName:   { type: String, default: '' },
+  wifeAadhaar:   { type: String, default: '' },   // 12-digit, primary identifier
+  husbandAadhaar:{ type: String, default: '' },
   wifeAge:       { type: String, default: '' },
   husbandAge:    { type: String, default: '' },
   village:       { type: String, default: '' },
@@ -604,7 +606,7 @@ app.get('/health', (_, res) => {
     success: true,
     message: 'AshaMitra backend is running',
     version: '1.0.0',
-    build: 'gemini-primary+lang-normalize+mch-schedule+reminders+ocr+remindlog+hbyc+aadhaarqr2+patientversionfix+agegenderfix+editlegacyversionfix+dobschedguard+identitydedup+referrals+pncschedule+watemplate+eligiblecouples+vitalevents-2026-06',
+    build: 'gemini-primary+lang-normalize+mch-schedule+reminders+ocr+remindlog+hbyc+aadhaarqr2+patientversionfix+agegenderfix+editlegacyversionfix+dobschedguard+identitydedup+referrals+pncschedule+watemplate+eligiblecouples+vitalevents+ecaadhaar-2026-06',
     ocr: !!tesseract,
     qr: !!(Jimp && jsQR), // Aadhaar QR engine loaded? (false ⇒ npm i jimp jsqr on VPS)
     chatPrimary: 'gemini', // resolveChatReply tries Gemini first, Groq fallback
