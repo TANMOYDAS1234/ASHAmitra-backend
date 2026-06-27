@@ -66,6 +66,7 @@ const patientSchema = new mongoose.Schema({
   dob:           { type: Date,   default: null }, // child / newborn date of birth
   lmp:           { type: Date,   default: null }, // last menstrual period (pregnancy)
   edd:           { type: Date,   default: null }, // expected delivery date (auto = lmp + 280d)
+  deliveryDate:  { type: Date,   default: null }, // actual delivery date → drives PNC schedule
   guardianName:  { type: String, default: '' },   // mother's name when patient is a child
   // Aadhaar: store ONLY a masked form (e.g. "XXXX-XXXX-1234") — never the raw
   // 12-digit number (Aadhaar Act sensitivity). OCR fills name/DOB/address.
@@ -308,6 +309,14 @@ const HBYC_PLAN = [
   { code: 'HBYC-15M', label: 'গৃহভিত্তিক শিশু যত্ন — ১৫ মাস', days: 455 },
 ];
 
+// Postnatal care for the MOTHER — generated from her delivery date (distinct
+// from the newborn's HBNC home visits). MCP card PNC schedule: days 3, 7, 42.
+const PNC_PLAN = [
+  { code: 'PNC-D3',  label: 'প্রসব-পরবর্তী পরিচর্যা — ৩য় দিন',  days: 3 },
+  { code: 'PNC-D7',  label: 'প্রসব-পরবর্তী পরিচর্যা — ৭ম দিন',   days: 7 },
+  { code: 'PNC-D42', label: 'প্রসব-পরবর্তী পরিচর্যা — ৪২তম দিন', days: 42 },
+];
+
 // Re-sync a patient's schedule after create/update. Upserts each computed event
 // by (patientId, kind, code): dates/labels are refreshed in place, but an
 // event already marked done/missed keeps its status (only set on insert).
@@ -322,6 +331,12 @@ async function syncScheduleForPatient(p) {
     const planned = [];
     if (p.lmp && isPregnancy) {
       for (const a of ANC_PLAN) planned.push({ kind: 'anc', code: a.code, label: a.label, dueDate: addDays(p.lmp, a.weeks * 7), meta: {} });
+    }
+    // Mother's postnatal (PNC) schedule — from her delivery date. Gated to an
+    // adult mother (never a child/newborn record) so a stray date can't make
+    // PNC events for a baby.
+    if (p.deliveryDate && !isNewborn && !isChild) {
+      for (const n of PNC_PLAN) planned.push({ kind: 'pnc', code: n.code, label: n.label, dueDate: addDays(p.deliveryDate, n.days), meta: {} });
     }
     // ONLY a child/newborn DOB drives the vaccine/HBNC schedule. A DOB stored on
     // a mother (pregnancy) or 'other' patient is just a record — it must never
@@ -414,14 +429,30 @@ async function sendWhatsappReminder(mobile, text) {
   const token = process.env.WHATSAPP_TOKEN, phoneId = process.env.WHATSAPP_PHONE_ID;
   if (!mobile || !token || !phoneId) return false; // not configured → skip silently
   try {
-    // Meta WhatsApp Cloud API. Free-form text works inside the 24-h customer
-    // window; for proactive sends an APPROVED TEMPLATE is required — once your
-    // template is approved, swap the `text` payload for a `template` payload.
+    // Meta WhatsApp Cloud API. Free-form text only works inside the 24-h
+    // customer window; PROACTIVE reminders need an APPROVED TEMPLATE. So when
+    // WHATSAPP_TEMPLATE (the approved template name) is set we send a template
+    // payload — the message body text rides in the first body variable {{1}}.
+    // Until then we fall back to a plain text payload (works in the 24-h window
+    // / for testing). Set WHATSAPP_TEMPLATE_LANG to match the template locale.
     const to = mobile.length === 10 ? `91${mobile}` : mobile;
+    const tmpl = process.env.WHATSAPP_TEMPLATE;
+    const payload = tmpl
+      ? {
+          messaging_product: 'whatsapp', to, type: 'template',
+          template: {
+            name: tmpl,
+            language: { code: process.env.WHATSAPP_TEMPLATE_LANG || 'bn' },
+            components: [
+              { type: 'body', parameters: [{ type: 'text', text }] },
+            ],
+          },
+        }
+      : { messaging_product: 'whatsapp', to, type: 'text', text: { body: text } };
     await fetch(`https://graph.facebook.com/v20.0/${phoneId}/messages`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${token}` },
-      body: JSON.stringify({ messaging_product: 'whatsapp', to, type: 'text', text: { body: text } }),
+      body: JSON.stringify(payload),
     });
     return true;
   } catch (err) { console.warn('[whatsapp]', err.message); return false; }
@@ -505,7 +536,7 @@ app.get('/health', (_, res) => {
     success: true,
     message: 'AshaMitra backend is running',
     version: '1.0.0',
-    build: 'gemini-primary+lang-normalize+mch-schedule+reminders+ocr+remindlog+hbyc+aadhaarqr2+patientversionfix+agegenderfix+editlegacyversionfix+dobschedguard+identitydedup+referrals-2026-06',
+    build: 'gemini-primary+lang-normalize+mch-schedule+reminders+ocr+remindlog+hbyc+aadhaarqr2+patientversionfix+agegenderfix+editlegacyversionfix+dobschedguard+identitydedup+referrals+pncschedule+watemplate-2026-06',
     ocr: !!tesseract,
     qr: !!(Jimp && jsQR), // Aadhaar QR engine loaded? (false ⇒ npm i jimp jsqr on VPS)
     chatPrimary: 'gemini', // resolveChatReply tries Gemini first, Groq fallback
