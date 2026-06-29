@@ -177,7 +177,8 @@ const scheduleEventSchema = new mongoose.Schema({
   kind:          { type: String, required: true }, // anc | vaccine | hbnc | followup
   code:          { type: String, required: true }, // ANC1 | V-6W | HBNC-D7 …
   label:         { type: String, default: '' },
-  dueDate:       { type: Date,   required: true, index: true },
+  dueDate:       { type: Date,   required: true, index: true }, // window START (becomes due)
+  windowEnd:     { type: Date,   default: null },  // last clinically-useful day; overdue only after this
   status:        { type: String, default: 'pending' }, // pending | done | missed | skipped
   doneDate:      { type: Date,   default: null },
   // Lead-times already fired by the reminder cron ('T-3','T-1','overdue') so a
@@ -345,11 +346,14 @@ function addDays(date, n) { return new Date(new Date(date).getTime() + n * DAY);
 // later window. Due weeks from LMP; labels carry the recommended window so the
 // worker/mother can see when each is due. (If a woman registers late, the early
 // visit simply shows overdue and is done at once.)
+// `weeks` = when the visit becomes due (window START); `endWeeks` = last
+// clinically-useful week (window END — overdue only after this). The gap is the
+// window the worker has to do the visit; doing it before `weeks` is "too early".
 const ANC_PLAN = [
-  { code: 'ANC1', label: 'ANC ১ম পরীক্ষা (১ম ত্রৈমাসিক · ১২ সপ্তাহের মধ্যে)', weeks: 10 },
-  { code: 'ANC2', label: 'ANC ২য় পরীক্ষা (১৪–২৬ সপ্তাহ)',                     weeks: 20 },
-  { code: 'ANC3', label: 'ANC ৩য় পরীক্ষা (২৮–৩৪ সপ্তাহ)',                     weeks: 30 },
-  { code: 'ANC4', label: 'ANC ৪র্থ পরীক্ষা (৩৬ সপ্তাহ–প্রসব)',                weeks: 36 },
+  { code: 'ANC1', label: 'ANC ১ম পরীক্ষা (১ম ত্রৈমাসিক · ১২ সপ্তাহের মধ্যে)', weeks: 10, endWeeks: 12 },
+  { code: 'ANC2', label: 'ANC ২য় পরীক্ষা (১৪–২৬ সপ্তাহ)',                     weeks: 14, endWeeks: 26 },
+  { code: 'ANC3', label: 'ANC ৩য় পরীক্ষা (২৮–৩৪ সপ্তাহ)',                     weeks: 28, endWeeks: 34 },
+  { code: 'ANC4', label: 'ANC ৪র্থ পরীক্ষা (৩৬ সপ্তাহ–প্রসব)',                weeks: 36, endWeeks: 42 },
 ];
 
 const VACCINE_PLAN = [
@@ -405,7 +409,12 @@ async function syncScheduleForPatient(p) {
 
     const planned = [];
     if (p.lmp && isPregnancy) {
-      for (const a of ANC_PLAN) planned.push({ kind: 'anc', code: a.code, label: a.label, dueDate: addDays(p.lmp, a.weeks * 7), meta: {} });
+      for (const a of ANC_PLAN) planned.push({
+        kind: 'anc', code: a.code, label: a.label,
+        dueDate: addDays(p.lmp, a.weeks * 7),
+        windowEnd: a.endWeeks ? addDays(p.lmp, a.endWeeks * 7) : null,
+        meta: {},
+      });
     }
     // Mother's postnatal (PNC) schedule — from her delivery date. Gated to an
     // adult mother (never a child/newborn record) so a stray date can't make
@@ -429,7 +438,7 @@ async function syncScheduleForPatient(p) {
         {
           $set: {
             ashaId: p.ashaId, patientName: p.name || '', patientMobile: p.mobile || '',
-            label: e.label, dueDate: e.dueDate, meta: e.meta,
+            label: e.label, dueDate: e.dueDate, windowEnd: e.windowEnd ?? null, meta: e.meta,
           },
           $setOnInsert: { status: 'pending', remindersSent: [] },
         },
@@ -545,11 +554,13 @@ async function runReminderScan() {
     }).limit(3000);
     let fired = 0;
     for (const e of events) {
-      const days = Math.round((e.dueDate - now) / DAY);
+      const end = e.windowEnd || e.dueDate;
+      const daysToDue = Math.round((e.dueDate - now) / DAY); // window opens
+      const daysToEnd = Math.round((end - now) / DAY);       // window closes
       let tag = null;
-      if (days < 0) tag = 'overdue';
-      else if (days <= 1) tag = 'T-1';
-      else if (days <= 3) tag = 'T-3';
+      if (daysToEnd < 0) tag = 'overdue';                    // window closed
+      else if (daysToDue >= 0 && daysToDue <= 1) tag = 'T-1';
+      else if (daysToDue > 1 && daysToDue <= 3) tag = 'T-3';
       if (!tag || (e.remindersSent || []).includes(tag)) continue;
 
       const text = reminderText(e);
@@ -611,7 +622,7 @@ app.get('/health', (_, res) => {
     success: true,
     message: 'AshaMitra backend is running',
     version: '1.0.0',
-    build: 'gemini-primary+lang-normalize+mch-schedule+reminders+ocr+remindlog+hbyc+aadhaarqr2+patientversionfix+agegenderfix+editlegacyversionfix+dobschedguard+identitydedup+referrals+pncschedule+watemplate+eligiblecouples+vitalevents+ecaadhaar+ancplan-2026-06',
+    build: 'gemini-primary+lang-normalize+mch-schedule+reminders+ocr+remindlog+hbyc+aadhaarqr2+patientversionfix+agegenderfix+editlegacyversionfix+dobschedguard+identitydedup+referrals+pncschedule+watemplate+eligiblecouples+vitalevents+ecaadhaar+ancplan+ancwindow-2026-06',
     ocr: !!tesseract,
     qr: !!(Jimp && jsQR), // Aadhaar QR engine loaded? (false ⇒ npm i jimp jsqr on VPS)
     chatPrimary: 'gemini', // resolveChatReply tries Gemini first, Groq fallback
@@ -1055,8 +1066,13 @@ app.get('/api/schedule/due', auth, async (req, res) => {
     const now = new Date();
     const data = events.map((e) => {
       const o = toClient(e);
-      o.overdue = e.dueDate < now;
+      const end = e.windowEnd || e.dueDate; // no window → due date is the cutoff
+      // Overdue only once the clinical window has closed; between due date and
+      // window end the visit is "due now, still in window".
+      o.overdue = end < now;
+      o.inWindow = e.dueDate <= now && now <= end;
       o.daysUntil = Math.round((e.dueDate - now) / DAY);
+      o.daysToWindowEnd = Math.round((end - now) / DAY);
       return o;
     });
     res.json({ success: true, data });
