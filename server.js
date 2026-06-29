@@ -476,8 +476,8 @@ function mirrorRchId(body) {
 // 1 day before, and once overdue — deduped via each event's `remindersSent`.
 // The worker does NOT get separate push notifications — they use the live
 // due/overdue shortlist instead. Reminders go to the MOTHER over:
-//   1. SMS      — active only when SMS_API_URL + SMS_API_KEY are set.
-//   2. WhatsApp — active only when WHATSAPP_TOKEN + WHATSAPP_PHONE_ID are set.
+//   1. SMS      — MSG91 Flow; active when SMS_API_KEY + SMS_TEMPLATE_ID are set.
+//   2. WhatsApp — Meta Cloud API; active when WHATSAPP_TOKEN + WHATSAPP_PHONE_ID set.
 // Both are skipped (no-op) until their credentials exist in .env. A lead-time
 // is marked "sent" only when a channel actually delivered, so once the keys
 // are added, pending/overdue items fire on the next scan.
@@ -496,16 +496,42 @@ function reminderText(e) {
   return `${who} — ${e.label}: ${when}।`;
 }
 
-async function sendSmsReminder(mobile, text) {
-  const url = process.env.SMS_API_URL, key = process.env.SMS_API_KEY;
-  if (!mobile || !url || !key) return false; // not configured → skip silently
+// Variables for the DLT SMS template. Free-text SMS to Indian numbers is not
+// allowed — the content must match a template registered on the DLT portal, so
+// we send the template id + these variables (not a composed sentence).
+function reminderVars(e) {
+  const days = Math.round((new Date(e.dueDate) - new Date()) / DAY);
+  const when = days < 0 ? `${Math.abs(days)} দিন পার`
+    : days === 0 ? 'আজ' : `${days} দিন পরে`;
+  return { name: e.patientName || 'রোগী', service: e.label || 'চেকআপ', due: when };
+}
+
+// SMS via MSG91 Flow API (DLT-compliant). Configure on the server (.env):
+//   SMS_API_KEY     = MSG91 authkey
+//   SMS_TEMPLATE_ID = the DLT-approved MSG91 flow template id
+//   SMS_SENDER      = 6-char DLT sender/header id (optional; usually set in tmpl)
+//   SMS_API_URL     = optional override (default = MSG91 flow endpoint)
+// Register a DLT template whose variables are name / service / due, e.g.:
+//   "Nomoskar ##name##, apnar ##service## ##due##. Onugroho kore nikotostho
+//    sasthyokendre jogajog korun."
+async function sendSmsReminder(mobile, vars) {
+  const key = process.env.SMS_API_KEY;
+  const templateId = process.env.SMS_TEMPLATE_ID;
+  if (!mobile || !key || !templateId) return false; // not configured → skip silently
+  const url = process.env.SMS_API_URL || 'https://control.msg91.com/api/v5/flow/';
+  const to = String(mobile).length === 10 ? `91${mobile}` : String(mobile);
   try {
-    await fetch(url, {
+    const body = {
+      template_id: templateId,
+      recipients: [{ mobiles: to, name: vars.name, service: vars.service, due: vars.due }],
+    };
+    if (process.env.SMS_SENDER) body.sender = process.env.SMS_SENDER;
+    const res = await fetch(url, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${key}` },
-      body: JSON.stringify({ to: mobile, sender: process.env.SMS_SENDER || 'ASHAMT', message: text }),
+      headers: { 'Content-Type': 'application/json', authkey: key },
+      body: JSON.stringify(body),
     });
-    return true;
+    return res.ok; // only mark "sent" when MSG91 accepted it
   } catch (err) { console.warn('[sms]', err.message); return false; }
 }
 
@@ -569,7 +595,7 @@ async function runReminderScan() {
       // when a channel actually delivered, so when the SMS/WhatsApp keys are
       // added later, still-pending items fire on the next scan.
       let sent = false;
-      if (await sendSmsReminder(e.patientMobile, text)) sent = true;
+      if (await sendSmsReminder(e.patientMobile, reminderVars(e))) sent = true;
       if (await sendWhatsappReminder(e.patientMobile, text)) sent = true;
       if (!sent) continue;
 
@@ -622,11 +648,18 @@ app.get('/health', (_, res) => {
     success: true,
     message: 'AshaMitra backend is running',
     version: '1.0.0',
-    build: 'gemini-primary+lang-normalize+mch-schedule+reminders+ocr+remindlog+hbyc+aadhaarqr2+patientversionfix+agegenderfix+editlegacyversionfix+dobschedguard+identitydedup+referrals+pncschedule+watemplate+eligiblecouples+vitalevents+ecaadhaar+ancplan+ancwindow-2026-06',
+    build: 'gemini-primary+lang-normalize+mch-schedule+reminders+ocr+remindlog+hbyc+aadhaarqr2+patientversionfix+agegenderfix+editlegacyversionfix+dobschedguard+identitydedup+referrals+pncschedule+watemplate+eligiblecouples+vitalevents+ecaadhaar+ancplan+ancwindow+reminderhealth+msg91sms-2026-06',
     ocr: !!tesseract,
     qr: !!(Jimp && jsQR), // Aadhaar QR engine loaded? (false ⇒ npm i jimp jsqr on VPS)
     chatPrimary: 'gemini', // resolveChatReply tries Gemini first, Groq fallback
     geminiKeys: (typeof geminiKeys !== 'undefined' && geminiKeys) ? geminiKeys.length : 0,
+    // Auto-reminder delivery channels (booleans only — never the secrets).
+    // The cron always runs; messages send only when a channel is configured.
+    reminders: {
+      cron: true, // scan scheduled (boot+hourly)
+      sms: !!(process.env.SMS_API_KEY && process.env.SMS_TEMPLATE_ID), // MSG91 flow
+      whatsapp: !!(process.env.WHATSAPP_TOKEN && process.env.WHATSAPP_PHONE_ID),
+    },
     db: {
       name: c && c.name ? c.name : null,
       host: c && c.host ? c.host : null,
