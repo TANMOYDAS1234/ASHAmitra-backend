@@ -340,11 +340,16 @@ async function notifyUser({ recipientId, type, title, body, link = '', data = {}
 const DAY = 24 * 60 * 60 * 1000;
 function addDays(date, n) { return new Date(new Date(date).getTime() + n * DAY); }
 
+// GoI / WB NHM 4-visit ANC schedule (min 4 visits). Visit 1 within the first
+// trimester (early registration — the most critical ANC timing), then one per
+// later window. Due weeks from LMP; labels carry the recommended window so the
+// worker/mother can see when each is due. (If a woman registers late, the early
+// visit simply shows overdue and is done at once.)
 const ANC_PLAN = [
-  { code: 'ANC1', label: 'ANC ১ম পরীক্ষা (প্রথম ত্রৈমাসিক)', weeks: 12 },
-  { code: 'ANC2', label: 'ANC ২য় পরীক্ষা',                   weeks: 20 },
-  { code: 'ANC3', label: 'ANC ৩য় পরীক্ষা',                   weeks: 30 },
-  { code: 'ANC4', label: 'ANC ৪র্থ পরীক্ষা',                  weeks: 36 },
+  { code: 'ANC1', label: 'ANC ১ম পরীক্ষা (১ম ত্রৈমাসিক · ১২ সপ্তাহের মধ্যে)', weeks: 10 },
+  { code: 'ANC2', label: 'ANC ২য় পরীক্ষা (১৪–২৬ সপ্তাহ)',                     weeks: 20 },
+  { code: 'ANC3', label: 'ANC ৩য় পরীক্ষা (২৮–৩৪ সপ্তাহ)',                     weeks: 30 },
+  { code: 'ANC4', label: 'ANC ৪র্থ পরীক্ষা (৩৬ সপ্তাহ–প্রসব)',                weeks: 36 },
 ];
 
 const VACCINE_PLAN = [
@@ -606,7 +611,7 @@ app.get('/health', (_, res) => {
     success: true,
     message: 'AshaMitra backend is running',
     version: '1.0.0',
-    build: 'gemini-primary+lang-normalize+mch-schedule+reminders+ocr+remindlog+hbyc+aadhaarqr2+patientversionfix+agegenderfix+editlegacyversionfix+dobschedguard+identitydedup+referrals+pncschedule+watemplate+eligiblecouples+vitalevents+ecaadhaar-2026-06',
+    build: 'gemini-primary+lang-normalize+mch-schedule+reminders+ocr+remindlog+hbyc+aadhaarqr2+patientversionfix+agegenderfix+editlegacyversionfix+dobschedguard+identitydedup+referrals+pncschedule+watemplate+eligiblecouples+vitalevents+ecaadhaar+ancplan-2026-06',
     ocr: !!tesseract,
     qr: !!(Jimp && jsQR), // Aadhaar QR engine loaded? (false ⇒ npm i jimp jsqr on VPS)
     chatPrimary: 'gemini', // resolveChatReply tries Gemini first, Groq fallback
