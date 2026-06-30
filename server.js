@@ -379,6 +379,32 @@ const tbCaseSchema = new mongoose.Schema({
 }, { timestamps: true });
 tbCaseSchema.index({ ashaId: 1, clientId: 1 });
 
+// ── Medicine stock (ASHA monthly drug account — "Form 2") ─────────────────────
+// The ASHA keeps a monthly account of every medicine in her drug kit (Form 2,
+// "three copies"). One row = one medicine for one month: opening balance, what
+// was received (+date), what was distributed/used, what expired, and the closing
+// balance (opening + received − issued − expired). Stored per (medicine, month)
+// so the app can regenerate the submittable Form-2 PDF and carry the closing
+// balance forward as next month's opening.
+const medicineStockSchema = new mongoose.Schema({
+  ashaId:        { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true, index: true },
+  clientId:      { type: String, default: '' },
+  medicineName:  { type: String, default: '' },
+  unit:          { type: String, default: 'tablet' }, // tablet|strip|packet|bottle|piece|tube
+  month:         { type: String, default: '', index: true }, // 'YYYY-MM'
+  openingStock:  { type: Number, default: 0 },        // in hand at start of month
+  receivedQty:   { type: Number, default: 0 },        // received this month
+  receivedDate:  { type: Date,   default: null },
+  issuedQty:     { type: Number, default: 0 },        // distributed / used this month
+  expiredQty:    { type: Number, default: 0 },        // expired / discarded
+  closingStock:  { type: Number, default: 0 },        // computed: opening + received − issued − expired
+  lowStockThreshold: { type: Number, default: 0 },    // flag when closing ≤ this
+  notes:         { type: String, default: '' },
+  status:        { type: String, default: 'active', index: true }, // active|closed
+  version:       { type: Number, default: 0 },
+}, { timestamps: true });
+medicineStockSchema.index({ ashaId: 1, clientId: 1 });
+
 const User          = mongoose.model('User',          userSchema);
 const Patient       = mongoose.model('Patient',       patientSchema);
 const Report        = mongoose.model('Report',        reportSchema);
@@ -390,6 +416,7 @@ const EligibleCouple= mongoose.model('EligibleCouple',eligibleCoupleSchema);
 const VitalEvent    = mongoose.model('VitalEvent',    vitalEventSchema);
 const NcdCbac       = mongoose.model('NcdCbac',       ncdCbacSchema);
 const TbCase        = mongoose.model('TbCase',        tbCaseSchema);
+const MedicineStock = mongoose.model('MedicineStock', medicineStockSchema);
 
 // ── Helper: create one notification per active admin ──────────────────────────
 async function notifyAllAdmins({ type, title, body, link = '', data = {} }) {
@@ -728,7 +755,7 @@ app.get('/health', (_, res) => {
     success: true,
     message: 'AshaMitra backend is running',
     version: '1.0.0',
-    build: 'gemini-primary+lang-normalize+mch-schedule+reminders+ocr+remindlog+hbyc+aadhaarqr2+patientversionfix+agegenderfix+editlegacyversionfix+dobschedguard+identitydedup+referrals+pncschedule+watemplate+eligiblecouples+vitalevents+ecaadhaar+ancplan+ancwindow+reminderhealth+msg91sms+ncdcbac+tbcases-2026-06',
+    build: 'gemini-primary+lang-normalize+mch-schedule+reminders+ocr+remindlog+hbyc+aadhaarqr2+patientversionfix+agegenderfix+editlegacyversionfix+dobschedguard+identitydedup+referrals+pncschedule+watemplate+eligiblecouples+vitalevents+ecaadhaar+ancplan+ancwindow+reminderhealth+msg91sms+ncdcbac+tbcases+medstock-2026-06',
     ocr: !!tesseract,
     qr: !!(Jimp && jsQR), // Aadhaar QR engine loaded? (false ⇒ npm i jimp jsqr on VPS)
     chatPrimary: 'gemini', // resolveChatReply tries Gemini first, Groq fallback
@@ -1165,6 +1192,7 @@ registerSyncedCrud('eligible-couples', EligibleCouple);
 registerSyncedCrud('vital-events', VitalEvent);
 registerSyncedCrud('ncd-cbac', NcdCbac);
 registerSyncedCrud('tb-cases', TbCase);
+registerSyncedCrud('medicine-stock', MedicineStock);
 
 // ── Schedule (ANC / immunization / HBNC due tracking) ─────────────────────────
 
