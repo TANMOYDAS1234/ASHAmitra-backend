@@ -301,6 +301,84 @@ const vitalEventSchema = new mongoose.Schema({
 }, { timestamps: true });
 vitalEventSchema.index({ ashaId: 1, clientId: 1 });
 
+// ── NCD / CBAC (Community-Based Assessment Checklist, 30+) ─────────────────────
+// The CBAC is the population-based screening checklist every adult 30+ fills once
+// (and is re-screened periodically). Part A is a 6-item risk score (≥4 = high
+// risk → refer for blood-pressure/sugar testing); Part B is a symptom checklist
+// for early detection of TB, oral/breast/cervical cancer and COPD (any "yes" →
+// refer). We store the raw option values (so the score can be recomputed/audited)
+// plus the computed riskScore and the symptom list. Optional patientId links the
+// person to a Patient record; otherwise the ASHA enters them ad-hoc.
+const ncdCbacSchema = new mongoose.Schema({
+  ashaId:        { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true, index: true },
+  clientId:      { type: String, default: '' },
+  patientId:     { type: String, default: '' },     // optional link to a Patient
+  personName:    { type: String, default: '' },
+  sex:           { type: String, default: '' },      // Female|Male|Other (waist scoring is sex-specific)
+  age:           { type: String, default: '' },
+  aadhaar:       { type: String, default: '' },
+  village:       { type: String, default: '' },
+  mobile:        { type: String, default: '' },
+  // ── Part A: risk-score components (stored as the chosen option) ──
+  ageBand:       { type: String, default: '' },      // 30-39|40-49|50-59|60+  (0/1/2/3)
+  tobacco:       { type: String, default: 'never' }, // never|past|current     (0/1/2)
+  alcohol:       { type: Boolean, default: false },  // daily alcohol          (0/1)
+  waist:         { type: String, default: 'normal' },// normal|medium|high     (0/1/2, sex-specific)
+  inactive:      { type: Boolean, default: false },  // physically inactive    (0/1)
+  familyHistory: { type: Boolean, default: false },  // HTN/diabetes/heart in 1st-degree relative (0/2)
+  riskScore:     { type: Number, default: 0 },       // computed total (0–11)
+  // ── Part B: early-detection symptoms (any → refer) ──
+  symptoms:      { type: [String], default: [] },
+  // ── Known conditions + measurements ──
+  knownHtn:      { type: Boolean, default: false },
+  knownDiabetes: { type: Boolean, default: false },
+  bp:            { type: String, default: '' },      // e.g. "130/85"
+  bloodSugar:    { type: String, default: '' },      // mg/dL
+  // ── Outcome ──
+  referred:      { type: Boolean, default: false },
+  referredTo:    { type: String, default: '' },
+  followUpDate:  { type: Date,   default: null, index: true },
+  notes:         { type: String, default: '' },
+  status:        { type: String, default: 'active', index: true }, // active|closed
+  version:       { type: Number, default: 0 },
+}, { timestamps: true });
+ncdCbacSchema.index({ ashaId: 1, clientId: 1 });
+
+// ── TB cases (presumptive screening + DOTS adherence) ─────────────────────────
+// Two-stage: (1) presumptive screening — symptom checklist; any "yes" means the
+// person is a presumptive TB case → refer for sputum/CBNAAT. (2) once a diagnosis
+// is confirmed, the same record tracks DOTS treatment (start date, regimen,
+// doses taken/missed, follow-up sputum, outcome) so the ASHA can support
+// adherence. `stage` switches the record between the two.
+const tbCaseSchema = new mongoose.Schema({
+  ashaId:        { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true, index: true },
+  clientId:      { type: String, default: '' },
+  patientId:     { type: String, default: '' },     // optional link to a Patient
+  personName:    { type: String, default: '' },
+  sex:           { type: String, default: '' },
+  age:           { type: String, default: '' },
+  village:       { type: String, default: '' },
+  mobile:        { type: String, default: '' },
+  stage:         { type: String, default: 'presumptive', index: true }, // presumptive|on_treatment|completed
+  // ── Presumptive screening ──
+  symptoms:      { type: [String], default: [] },    // cough2w|fever2w|weight_loss|night_sweats|blood_sputum|contact
+  referredForTest:{ type: Boolean, default: false }, // referred for sputum/CBNAAT
+  testResult:    { type: String, default: '' },      // pending|positive|negative
+  // ── Treatment / DOTS ──
+  tbType:        { type: String, default: '' },      // pulmonary|extra_pulmonary
+  treatmentStart:{ type: Date,   default: null },
+  regimen:       { type: String, default: '' },      // free text (e.g. "HRZE 2m + HRE 4m")
+  dosesTaken:    { type: String, default: '' },
+  dosesMissed:   { type: String, default: '' },
+  followUpSputum:{ type: String, default: '' },      // pending|positive|negative
+  nikshayId:     { type: String, default: '' },      // Ni-kshay (national TB registry) id
+  outcome:       { type: String, default: '' },      // cured|completed|lost|died|failed
+  followUpDate:  { type: Date,   default: null, index: true },
+  notes:         { type: String, default: '' },
+  version:       { type: Number, default: 0 },
+}, { timestamps: true });
+tbCaseSchema.index({ ashaId: 1, clientId: 1 });
+
 const User          = mongoose.model('User',          userSchema);
 const Patient       = mongoose.model('Patient',       patientSchema);
 const Report        = mongoose.model('Report',        reportSchema);
@@ -310,6 +388,8 @@ const ScheduleEvent = mongoose.model('ScheduleEvent', scheduleEventSchema);
 const Referral      = mongoose.model('Referral',      referralSchema);
 const EligibleCouple= mongoose.model('EligibleCouple',eligibleCoupleSchema);
 const VitalEvent    = mongoose.model('VitalEvent',    vitalEventSchema);
+const NcdCbac       = mongoose.model('NcdCbac',       ncdCbacSchema);
+const TbCase        = mongoose.model('TbCase',        tbCaseSchema);
 
 // ── Helper: create one notification per active admin ──────────────────────────
 async function notifyAllAdmins({ type, title, body, link = '', data = {} }) {
@@ -648,7 +728,7 @@ app.get('/health', (_, res) => {
     success: true,
     message: 'AshaMitra backend is running',
     version: '1.0.0',
-    build: 'gemini-primary+lang-normalize+mch-schedule+reminders+ocr+remindlog+hbyc+aadhaarqr2+patientversionfix+agegenderfix+editlegacyversionfix+dobschedguard+identitydedup+referrals+pncschedule+watemplate+eligiblecouples+vitalevents+ecaadhaar+ancplan+ancwindow+reminderhealth+msg91sms-2026-06',
+    build: 'gemini-primary+lang-normalize+mch-schedule+reminders+ocr+remindlog+hbyc+aadhaarqr2+patientversionfix+agegenderfix+editlegacyversionfix+dobschedguard+identitydedup+referrals+pncschedule+watemplate+eligiblecouples+vitalevents+ecaadhaar+ancplan+ancwindow+reminderhealth+msg91sms+ncdcbac+tbcases-2026-06',
     ocr: !!tesseract,
     qr: !!(Jimp && jsQR), // Aadhaar QR engine loaded? (false ⇒ npm i jimp jsqr on VPS)
     chatPrimary: 'gemini', // resolveChatReply tries Gemini first, Groq fallback
@@ -1083,6 +1163,8 @@ function registerSyncedCrud(path, Model) {
 
 registerSyncedCrud('eligible-couples', EligibleCouple);
 registerSyncedCrud('vital-events', VitalEvent);
+registerSyncedCrud('ncd-cbac', NcdCbac);
+registerSyncedCrud('tb-cases', TbCase);
 
 // ── Schedule (ANC / immunization / HBNC due tracking) ─────────────────────────
 
