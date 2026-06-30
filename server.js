@@ -332,6 +332,8 @@ const ncdCbacSchema = new mongoose.Schema({
   // ── Known conditions + measurements ──
   knownHtn:      { type: Boolean, default: false },
   knownDiabetes: { type: Boolean, default: false },
+  knownHeart:    { type: Boolean, default: false },  // known CVD / stroke
+  knownCopd:     { type: Boolean, default: false },  // known asthma / COPD
   bp:            { type: String, default: '' },      // e.g. "130/85"
   bloodSugar:    { type: String, default: '' },      // mg/dL
   // ── Outcome ──
@@ -456,11 +458,13 @@ function addDays(date, n) { return new Date(new Date(date).getTime() + n * DAY);
 // `weeks` = when the visit becomes due (window START); `endWeeks` = last
 // clinically-useful week (window END — overdue only after this). The gap is the
 // window the worker has to do the visit; doing it before `weeks` is "too early".
+// West Bengal revised 4-visit ANC schedule (per the state ANC card): 1st 14–26,
+// 2nd 28–32, 3rd 34→delivery, 4th before delivery.
 const ANC_PLAN = [
-  { code: 'ANC1', label: 'ANC ১ম পরীক্ষা (১ম ত্রৈমাসিক · ১২ সপ্তাহের মধ্যে)', weeks: 10, endWeeks: 12 },
-  { code: 'ANC2', label: 'ANC ২য় পরীক্ষা (১৪–২৬ সপ্তাহ)',                     weeks: 14, endWeeks: 26 },
-  { code: 'ANC3', label: 'ANC ৩য় পরীক্ষা (২৮–৩৪ সপ্তাহ)',                     weeks: 28, endWeeks: 34 },
-  { code: 'ANC4', label: 'ANC ৪র্থ পরীক্ষা (৩৬ সপ্তাহ–প্রসব)',                weeks: 36, endWeeks: 42 },
+  { code: 'ANC1', label: 'ANC ১ম পরীক্ষা (১৪–২৬ সপ্তাহ)',           weeks: 14, endWeeks: 26 },
+  { code: 'ANC2', label: 'ANC ২য় পরীক্ষা (২৮–৩২ সপ্তাহ)',           weeks: 28, endWeeks: 32 },
+  { code: 'ANC3', label: 'ANC ৩য় পরীক্ষা (৩৪ সপ্তাহ – প্রসবের আগে)', weeks: 34, endWeeks: 38 },
+  { code: 'ANC4', label: 'ANC ৪র্থ পরীক্ষা (প্রসবের আগ পর্যন্ত)',     weeks: 38, endWeeks: 42 },
 ];
 
 const VACCINE_PLAN = [
@@ -579,15 +583,19 @@ function mirrorRchId(body) {
 
 // ── Automatic reminder engine ─────────────────────────────────────────────────
 // A lightweight in-process scheduler (no extra dependency) scans pending
-// schedule events and fires reminders at three lead-times — 3 days before,
-// 1 day before, and once overdue — deduped via each event's `remindersSent`.
-// The worker does NOT get separate push notifications — they use the live
-// due/overdue shortlist instead. Reminders go to the MOTHER over:
+// schedule events and reminds across the whole visit lifecycle, deduped via each
+// event's `remindersSent`:
+//   • T-1     — one day before / on the checkup date (patient reminder).
+//   • missed  — the day the checkup date passes with the visit still pending:
+//               the WORKER gets an in-app notification (works without SMS), then
+//   • weekly  — a patient reminder every following week while it stays pending
+//               and within the window, so a missed visit keeps nudging.
+//   • overdue — once the window fully closes.
+// Patient reminders go to the MOTHER over:
 //   1. SMS      — MSG91 Flow; active when SMS_API_KEY + SMS_TEMPLATE_ID are set.
 //   2. WhatsApp — Meta Cloud API; active when WHATSAPP_TOKEN + WHATSAPP_PHONE_ID set.
-// Both are skipped (no-op) until their credentials exist in .env. A lead-time
-// is marked "sent" only when a channel actually delivered, so once the keys
-// are added, pending/overdue items fire on the next scan.
+// Both are no-ops until their credentials exist in .env; the worker's missed-
+// visit notification still fires regardless.
 
 function reminderText(e) {
   const who = e.patientName || 'রোগী';
@@ -681,31 +689,53 @@ async function runReminderScan() {
   _reminderScanRunning = true;
   try {
     const now = new Date();
-    const horizon = addDays(now, 3); // remind from 3 days before … through overdue
+    // From 1 day before each visit's due date onward — covers the T-1 nudge, the
+    // weekly nudges through the open window, and overdue once the window closes.
+    const horizon = addDays(now, 1);
     const events = await ScheduleEvent.find({
       status: 'pending', dueDate: { $lte: horizon },
     }).limit(3000);
     let fired = 0;
     for (const e of events) {
       const end = e.windowEnd || e.dueDate;
-      const daysToDue = Math.round((e.dueDate - now) / DAY); // window opens
+      const daysToDue = Math.round((e.dueDate - now) / DAY); // checkup date (window opens)
       const daysToEnd = Math.round((end - now) / DAY);       // window closes
       let tag = null;
-      if (daysToEnd < 0) tag = 'overdue';                    // window closed
-      else if (daysToDue >= 0 && daysToDue <= 1) tag = 'T-1';
-      else if (daysToDue > 1 && daysToDue <= 3) tag = 'T-3';
+      let firstMiss = false;
+      if (daysToEnd < 0) {
+        tag = 'overdue';                                     // window fully closed
+      } else if (daysToDue >= 0 && daysToDue <= 1) {
+        tag = 'T-1';                                         // one day before / on the date
+      } else if (daysToDue < 0) {
+        // Past the checkup date but still inside the window → weekly nudge until
+        // it's done or the window closes. Week 0 = the week it was missed.
+        const weekIdx = Math.floor((-daysToDue) / 7);
+        tag = `miss-W${weekIdx}`;
+        firstMiss = !(e.remindersSent || []).some((t) => String(t).startsWith('miss-'));
+      }
       if (!tag || (e.remindersSent || []).includes(tag)) continue;
 
-      const text = reminderText(e);
-      // Mother-facing reminders only (no separate worker notification — the
-      // worker uses the due-list shortlist). Mark the lead-time as sent ONLY
-      // when a channel actually delivered, so when the SMS/WhatsApp keys are
-      // added later, still-pending items fire on the next scan.
-      let sent = false;
-      if (await sendSmsReminder(e.patientMobile, reminderVars(e))) sent = true;
-      if (await sendWhatsappReminder(e.patientMobile, text)) sent = true;
-      if (!sent) continue;
+      // The moment a checkup is missed, notify the worker in-app — this works
+      // even before SMS/WhatsApp are enabled. Fires once per missed visit.
+      if (firstMiss) {
+        await notifyUser({
+          recipientId: e.ashaId,
+          type: 'visit_missed',
+          title: 'চেকআপ বকেয়া পড়েছে',
+          body: `${e.patientName || 'রোগী'} — ${e.label || ''} বকেয়া। সম্পন্ন না হওয়া পর্যন্ত সপ্তাহে একবার মনে করানো হবে।`,
+          link: '/schedule/due',
+          data: { eventId: String(e._id), kind: e.kind, code: e.code },
+        });
+      }
 
+      // Patient-facing reminder (only actually delivers once a channel is on).
+      const text = reminderText(e);
+      if (await sendSmsReminder(e.patientMobile, reminderVars(e))) { /* delivered */ }
+      if (await sendWhatsappReminder(e.patientMobile, text)) { /* delivered */ }
+
+      // Mark this lead-time / week done so it isn't repeated within the same
+      // window slice (and the worker isn't re-notified hourly). Future weeks
+      // still fire — and start delivering patient SMS the day channels are added.
       e.remindersSent = [...(e.remindersSent || []), tag];
       await e.save();
       fired++;
@@ -755,7 +785,7 @@ app.get('/health', (_, res) => {
     success: true,
     message: 'AshaMitra backend is running',
     version: '1.0.0',
-    build: 'gemini-primary+lang-normalize+mch-schedule+reminders+ocr+remindlog+hbyc+aadhaarqr2+patientversionfix+agegenderfix+editlegacyversionfix+dobschedguard+identitydedup+referrals+pncschedule+watemplate+eligiblecouples+vitalevents+ecaadhaar+ancplan+ancwindow+reminderhealth+msg91sms+ncdcbac+tbcases+medstock-2026-06',
+    build: 'gemini-primary+lang-normalize+mch-schedule+reminders+ocr+remindlog+hbyc+aadhaarqr2+patientversionfix+agegenderfix+editlegacyversionfix+dobschedguard+identitydedup+referrals+pncschedule+watemplate+eligiblecouples+vitalevents+ecaadhaar+ancplan+ancwindow+reminderhealth+msg91sms+ncdcbac+tbcases+medstock+ancwb+missweekly-2026-06',
     ocr: !!tesseract,
     qr: !!(Jimp && jsQR), // Aadhaar QR engine loaded? (false ⇒ npm i jimp jsqr on VPS)
     chatPrimary: 'gemini', // resolveChatReply tries Gemini first, Groq fallback
