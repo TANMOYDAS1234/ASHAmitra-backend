@@ -785,7 +785,7 @@ app.get('/health', (_, res) => {
     success: true,
     message: 'AshaMitra backend is running',
     version: '1.0.0',
-    build: 'gemini-primary+lang-normalize+mch-schedule+reminders+ocr+remindlog+hbyc+aadhaarqr2+patientversionfix+agegenderfix+editlegacyversionfix+dobschedguard+identitydedup+referrals+pncschedule+watemplate+eligiblecouples+vitalevents+ecaadhaar+ancplan+ancwindow+reminderhealth+msg91sms+ncdcbac+tbcases+medstock+ancwb+missweekly-2026-06',
+    build: 'gemini-primary+lang-normalize+mch-schedule+reminders+ocr+remindlog+hbyc+aadhaarqr2+patientversionfix+agegenderfix+editlegacyversionfix+dobschedguard+identitydedup+referrals+pncschedule+watemplate+eligiblecouples+vitalevents+ecaadhaar+ancplan+ancwindow+reminderhealth+msg91sms+ncdcbac+tbcases+medstock+ancwb+missweekly+adminmodstats-2026-06',
     ocr: !!tesseract,
     qr: !!(Jimp && jsQR), // Aadhaar QR engine loaded? (false ⇒ npm i jimp jsqr on VPS)
     chatPrimary: 'gemini', // resolveChatReply tries Gemini first, Groq fallback
@@ -1893,15 +1893,50 @@ app.get('/api/admin/locations', auth, adminOnly, async (_req, res) => {
 app.get('/api/admin/stats', auth, adminOnly, async (req, res) => {
   try {
     const workerQuery = { $or: [{ isAdmin: false }, { role: 'asha_worker' }], isActive: true };
-    const [totalWorkers, totalPatients, totalReports, redReports, yellowReports, greenReports] = await Promise.all([
+    const [
+      totalWorkers, totalPatients, totalReports, redReports, yellowReports, greenReports,
+      // ── Module aggregates (across all ASHAs) ──
+      ncdScreened, ncdHighRisk,
+      tbPresumptive, tbOnTreatment,
+      medLowStock,
+      vitalPendingCrs,
+      referralOpen,
+    ] = await Promise.all([
       User.countDocuments(workerQuery),
       Patient.countDocuments(),
       Report.countDocuments(),
       Report.countDocuments({ finalBand: 'RED' }),
       Report.countDocuments({ finalBand: 'YELLOW' }),
       Report.countDocuments({ finalBand: 'GREEN' }),
+      // NCD/CBAC: total screened + high-risk (score ≥ 4 or any symptom)
+      NcdCbac.countDocuments(),
+      NcdCbac.countDocuments({ $or: [{ riskScore: { $gte: 4 } }, { 'symptoms.0': { $exists: true } }] }),
+      // TB: presumptive (screening) + currently on DOTS
+      TbCase.countDocuments({ stage: 'presumptive' }),
+      TbCase.countDocuments({ stage: 'on_treatment' }),
+      // Medicine stock: lines running low (threshold set & closing ≤ threshold)
+      MedicineStock.countDocuments({
+        lowStockThreshold: { $gt: 0 },
+        $expr: { $lte: ['$closingStock', '$lowStockThreshold'] },
+      }),
+      // Vital events: births/deaths not yet registered with CRS
+      VitalEvent.countDocuments({ registered: { $ne: true } }),
+      // Referrals still open (not completed)
+      Referral.countDocuments({ status: { $nin: ['completed', 'closed'] } }),
     ]);
-    res.json({ success: true, data: { totalWorkers, totalPatients, totalReports, redReports, yellowReports, greenReports } });
+    res.json({
+      success: true,
+      data: {
+        totalWorkers, totalPatients, totalReports, redReports, yellowReports, greenReports,
+        modules: {
+          ncdScreened, ncdHighRisk,
+          tbPresumptive, tbOnTreatment,
+          medLowStock,
+          vitalPendingCrs,
+          referralOpen,
+        },
+      },
+    });
   } catch (err) {
     res.status(500).json({ success: false, message: err.message });
   }
