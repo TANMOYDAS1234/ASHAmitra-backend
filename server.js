@@ -2832,6 +2832,50 @@ app.get('/api/directions', async (req, res) => {
   }
 });
 
+// ── Report PDF — server-side render ─────────────────────────────────────────
+// The app posts fully self-contained HTML (SolaimanLipi embedded as base64) and
+// we render it to a PDF with headless Chromium, so Bengali shaping is perfect
+// and doesn't depend on the worker's (often budget) phone WebView. One shared
+// browser instance is reused across requests.
+let _pdfBrowser = null;
+async function _getPdfBrowser() {
+  let puppeteer;
+  try { puppeteer = require('puppeteer'); }
+  catch { throw new Error('puppeteer not installed — run `npm install` on the server'); }
+  if (_pdfBrowser && _pdfBrowser.connected) return _pdfBrowser;
+  _pdfBrowser = await puppeteer.launch({
+    headless: 'new',
+    args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage', '--disable-gpu'],
+  });
+  return _pdfBrowser;
+}
+
+app.post('/api/report/pdf', auth, async (req, res) => {
+  const { html, landscape } = req.body || {};
+  if (!html || typeof html !== 'string') {
+    return res.status(400).json({ success: false, message: 'html required' });
+  }
+  let page;
+  try {
+    const browser = await _getPdfBrowser();
+    page = await browser.newPage();
+    await page.setContent(html, { waitUntil: 'networkidle0', timeout: 20000 });
+    const pdf = await page.pdf({
+      printBackground: true,
+      landscape: !!landscape,
+      format: 'A4',
+      margin: { top: '12mm', bottom: '12mm', left: '9mm', right: '9mm' },
+    });
+    res.set('Content-Type', 'application/pdf');
+    res.send(pdf);
+  } catch (e) {
+    console.error('[report/pdf]', e.message);
+    res.status(500).json({ success: false, message: e.message });
+  } finally {
+    if (page) { try { await page.close(); } catch (_) {} }
+  }
+});
+
 // ── Start ─────────────────────────────────────────────────────────────────────
 const PORT = process.env.PORT || 5000;
 app.listen(PORT, () => console.log(`AshaМітра backend running on port ${PORT}`));

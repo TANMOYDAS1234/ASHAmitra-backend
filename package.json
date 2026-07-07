@@ -15,7 +15,8 @@
     "mongoose": "^8.4.1",
     "node-tesseract-ocr": "^2.2.1",
     "jimp": "^0.22.12",
-    "jsqr": "^1.4.0"
+    "jsqr": "^1.4.0",
+    "puppeteer": "^22.15.0"
   },
   "devDependencies": {
     "nodemon": "^3.1.14"
