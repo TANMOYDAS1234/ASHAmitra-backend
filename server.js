@@ -24,14 +24,47 @@ app.use(express.urlencoded({ limit: '10mb', extended: true }));
 
 // ── Atlas connection ──────────────────────────────────────────────────────────
 mongoose.connect(process.env.MONGO_URI)
-  .then(() => console.log('MongoDB Atlas connected'))
+  .then(() => { console.log('MongoDB Atlas connected'); migrateHierarchy(); })
   .catch(err => { console.error('Atlas connection error:', err.message); process.exit(1); });
+
+// One-time, idempotent: fold the legacy flat admin into the supervisor tree so
+// scoped queries work. The single pilot admin becomes an ANM; every ASHA with
+// no supervisor is placed under her. Safe to re-run on every boot.
+async function migrateHierarchy() {
+  try {
+    await User.updateMany(
+      { isAdmin: true, $or: [{ role: { $exists: false } }, { role: null }, { role: 'asha_worker' }] },
+      { $set: { role: 'anm' } });
+    await User.updateMany(
+      { isAdmin: { $ne: true }, $or: [{ role: { $exists: false } }, { role: null }] },
+      { $set: { role: 'asha_worker' } });
+    const anm = await User.findOne({ role: 'anm' }).select('_id');
+    if (anm) {
+      const r = await User.updateMany(
+        { role: 'asha_worker', $or: [{ supervisorId: null }, { supervisorId: { $exists: false } }] },
+        { $set: { supervisorId: anm._id } });
+      console.log(`Hierarchy migration ok — ${r.modifiedCount ?? 0} ASHAs linked under ANM ${anm._id}`);
+    }
+  } catch (e) {
+    console.error('Hierarchy migration failed:', e.message);
+  }
+}
+
+// ── Supervisory hierarchy: asha_worker < anm < bmho < cmho ───────────────────
+// Each supervisor owns the people directly below them via `supervisorId`, so a
+// query can scope precisely to "my subtree". The legacy flat admin maps to anm.
+const ROLES      = ['asha_worker', 'anm', 'bmho', 'cmho'];
+const CHILD_ROLE = { cmho: 'bmho', bmho: 'anm', anm: 'asha_worker' }; // level each role creates
+const effectiveRole = (u) => u.role || (u.isAdmin ? 'anm' : 'asha_worker');
 
 // ── Schemas ───────────────────────────────────────────────────────────────────
 
 const userSchema = new mongoose.Schema({
   phone:            { type: String, required: true, unique: true },
   name:             { type: String, default: '' },
+  role:             { type: String, enum: ROLES, default: 'asha_worker' },
+  supervisorId:     { type: mongoose.Schema.Types.ObjectId, ref: 'User', default: null },
+  subCentre:        { type: String, default: '' },
   block:            { type: String, default: '' },
   district:         { type: String, default: '' },
   isAdmin:          { type: Boolean, default: false },
@@ -772,6 +805,51 @@ function adminOnly(req, res, next) {
   next();
 }
 
+// ── Hierarchy scoping ────────────────────────────────────────────────────────
+// Everyone strictly below `rootId` in the supervisor tree (BFS over supervisorId).
+async function subtreeUserIds(rootId) {
+  const out = [];
+  let frontier = [rootId.toString()];
+  const seen = new Set(frontier);
+  while (frontier.length) {
+    const kids = await User.find({ supervisorId: { $in: frontier } }).select('_id').lean();
+    const next = [];
+    for (const k of kids) {
+      const s = k._id.toString();
+      if (!seen.has(s)) { seen.add(s); out.push(s); next.push(s); }
+    }
+    frontier = next;
+  }
+  return out;
+}
+
+// ASHA-level ids anywhere in a supervisor's subtree — scopes patients/reports.
+async function subtreeAshaIds(user) {
+  const ids = await subtreeUserIds(user.id);
+  if (!ids.length) return [];
+  const ashas = await User.find({ _id: { $in: ids }, role: 'asha_worker' }).select('_id').lean();
+  return ashas.map(u => u._id.toString());
+}
+
+// The people directly below the requester (the one level they manage).
+function directReports(user) {
+  return User.find({ supervisorId: user.id }).select('-otp -otpExpiry');
+}
+
+// Gate: supervisor roles only (anm/bmho/cmho); legacy admin passes as anm.
+function requireSupervisor(req, res, next) {
+  if (effectiveRole(req.user) === 'asha_worker')
+    return res.status(403).json({ success: false, message: 'Supervisor only' });
+  next();
+}
+
+// True if `targetId` is within the requester's subtree (or is them).
+async function inSubtree(user, targetId) {
+  if (targetId.toString() === user.id.toString()) return true;
+  const ids = await subtreeUserIds(user.id);
+  return ids.includes(targetId.toString());
+}
+
 // ── Health ───────────────────────────────────────────────────────────────────
 // `build` is a deploy marker — bump it on every deploy so GET /health proves
 // the new code actually restarted (if the marker is stale, the auto-deploy
@@ -785,7 +863,7 @@ app.get('/health', (_, res) => {
     success: true,
     message: 'AshaMitra backend is running',
     version: '1.0.0',
-    build: 'gemini-primary+lang-normalize+mch-schedule+reminders+ocr+remindlog+hbyc+aadhaarqr2+patientversionfix+agegenderfix+editlegacyversionfix+dobschedguard+identitydedup+referrals+pncschedule+watemplate+eligiblecouples+vitalevents+ecaadhaar+ancplan+ancwindow+reminderhealth+msg91sms+ncdcbac+tbcases+medstock+ancwb+missweekly+adminmodstats-2026-06',
+    build: 'gemini-primary+lang-normalize+mch-schedule+reminders+ocr+remindlog+hbyc+aadhaarqr2+patientversionfix+agegenderfix+editlegacyversionfix+dobschedguard+identitydedup+referrals+pncschedule+watemplate+eligiblecouples+vitalevents+ecaadhaar+ancplan+ancwindow+reminderhealth+msg91sms+ncdcbac+tbcases+medstock+ancwb+missweekly+adminmodstats+hierarchy-roles-2026-07',
     ocr: !!tesseract,
     qr: !!(Jimp && jsQR), // Aadhaar QR engine loaded? (false ⇒ npm i jimp jsqr on VPS)
     chatPrimary: 'gemini', // resolveChatReply tries Gemini first, Groq fallback
@@ -843,8 +921,10 @@ app.post('/api/auth/verify-otp', async (req, res) => {
 
     await User.updateOne({ phone }, { otp: null, otpExpiry: null });
 
+    const role = effectiveRole(user);
     const token = jwt.sign(
-      { id: user._id, phone: user.phone, isAdmin: user.isAdmin ?? (user.role === 'admin'), role: user.role ?? (user.isAdmin ? 'admin' : 'asha_worker') },
+      { id: user._id, phone: user.phone, isAdmin: user.isAdmin, role,
+        supervisorId: user.supervisorId ? user.supervisorId.toString() : null },
       process.env.JWT_SECRET,
       { expiresIn: '30d' }
     );
@@ -853,9 +933,10 @@ app.post('/api/auth/verify-otp', async (req, res) => {
       token,
       user: {
         id: user._id.toString(), phone: user.phone, name: user.name,
+        role, supervisorId: user.supervisorId ? user.supervisorId.toString() : null,
+        subCentre: user.subCentre ?? '',
         block: user.block, district: user.district,
         isAdmin: user.isAdmin,
-        role: user.isAdmin ? 'admin' : 'asha_worker',
         isActive: user.isActive,
         profileImagePath: user.profileImagePath ?? null,
       },
@@ -878,9 +959,11 @@ app.put('/api/auth/profile', auth, async (req, res) => {
       success: true,
       user: {
         id: user._id.toString(), phone: user.phone, name: user.name,
+        role: effectiveRole(user),
+        supervisorId: user.supervisorId ? user.supervisorId.toString() : null,
+        subCentre: user.subCentre ?? '',
         block: user.block, district: user.district,
         isAdmin: user.isAdmin,
-        role: user.isAdmin ? 'admin' : 'asha_worker',
         isActive: user.isActive,
         profileImagePath: user.profileImagePath ?? null,
       },
@@ -1708,35 +1791,49 @@ app.put('/api/users/:id', auth, async (req, res) => {
 
 // ── Admin ─────────────────────────────────────────────────────────────────────
 
-app.get('/api/admin/workers', auth, adminOnly, async (req, res) => {
+app.get('/api/admin/workers', auth, requireSupervisor, async (req, res) => {
   try {
-    const workers = await User.find({
-      $or: [{ isAdmin: false }, { isAdmin: { $exists: false } }, { role: 'asha_worker' }]
-    }).select('-otp -otpExpiry');
+    // The level directly below the requester: ANM→ASHAs, BMHO→ANMs, CMHO→BMHOs.
+    const workers = await directReports(req.user);
     res.json({ success: true, data: workers.map(toClient) });
   } catch (err) {
     res.status(500).json({ success: false, message: err.message });
   }
 });
 
-app.post('/api/admin/workers', auth, adminOnly, async (req, res) => {
+app.post('/api/admin/workers', auth, requireSupervisor, async (req, res) => {
   try {
-    const worker = await User.create({ ...req.body, isAdmin: false });
-    notifyUser({
-      recipientId: worker._id,
-      type: 'welcome',
-      title: 'আশামিত্রে স্বাগতম, দিদি',
-      body:  'আপনি এখন রোগী যোগ করতে ও ভয়েস ট্রায়াজ শুরু করতে পারেন।',
-      link:  '/home',
+    // A supervisor can only create the level directly below their own role,
+    // and the new user is rooted under them (supervisorId), inheriting scope.
+    const childRole = CHILD_ROLE[effectiveRole(req.user)];
+    if (!childRole)
+      return res.status(403).json({ success: false, message: 'Your role cannot create users' });
+    const me = await User.findById(req.user.id).select('block district subCentre');
+    const worker = await User.create({
+      ...req.body,
+      role: childRole,
+      supervisorId: req.user.id,
+      isAdmin: childRole !== 'asha_worker',
+      // Inherit geography unless the caller supplied it explicitly.
+      district: req.body.district ?? me?.district ?? '',
+      block:    req.body.block    ?? me?.block    ?? '',
     });
+    const welcome = {
+      asha_worker: { t: 'আশামিত্রে স্বাগতম, দিদি', b: 'আপনি এখন রোগী যোগ করতে ও ভয়েস ট্রায়াজ শুরু করতে পারেন।', l: '/home' },
+      anm:  { t: 'স্বাগতম — ANM প্যানেল', b: 'আপনার ASHA-দের রেকর্ড ও রিপোর্ট এখানে দেখুন।', l: '/admin' },
+      bmho: { t: 'স্বাগতম — BMHO প্যানেল', b: 'আপনার ব্লকের ANM ও ASHA-দের তথ্য এখানে।', l: '/admin' },
+    }[childRole] ?? { t: 'স্বাগতম', b: '', l: '/home' };
+    notifyUser({ recipientId: worker._id, type: 'welcome', title: welcome.t, body: welcome.b, link: welcome.l });
     res.status(201).json({ success: true, data: toClient(worker) });
   } catch (err) {
     res.status(500).json({ success: false, message: err.message });
   }
 });
 
-app.patch('/api/admin/workers/:id/deactivate', auth, adminOnly, async (req, res) => {
+app.patch('/api/admin/workers/:id/deactivate', auth, requireSupervisor, async (req, res) => {
   try {
+    if (!(await inSubtree(req.user, req.params.id)))
+      return res.status(403).json({ success: false, message: 'Not in your team' });
     await User.findByIdAndUpdate(req.params.id, { isActive: false });
     res.json({ success: true });
   } catch (err) {
@@ -1744,8 +1841,10 @@ app.patch('/api/admin/workers/:id/deactivate', auth, adminOnly, async (req, res)
   }
 });
 
-app.patch('/api/admin/workers/:id/activate', auth, adminOnly, async (req, res) => {
+app.patch('/api/admin/workers/:id/activate', auth, requireSupervisor, async (req, res) => {
   try {
+    if (!(await inSubtree(req.user, req.params.id)))
+      return res.status(403).json({ success: false, message: 'Not in your team' });
     await User.findByIdAndUpdate(req.params.id, { isActive: true });
     res.json({ success: true });
   } catch (err) {
@@ -1753,7 +1852,7 @@ app.patch('/api/admin/workers/:id/activate', auth, adminOnly, async (req, res) =
   }
 });
 
-app.get('/api/admin/reports', auth, adminOnly, async (req, res) => {
+app.get('/api/admin/reports', auth, requireSupervisor, async (req, res) => {
   try {
     // Soft-deleted reports are hidden from the default admin view but
     // accessible via /api/admin/reports/deleted for audit purposes.
@@ -1783,8 +1882,13 @@ app.get('/api/admin/reports', auth, adminOnly, async (req, res) => {
     // matches against the User collection; we look up the matching ashaIds
     // first, then scope reports to those workers. Combined with band/date
     // filters via $and-like merge.
+    // Base scope: only ASHAs anywhere in the requester's subtree. Any explicit
+    // worker/district/block filter is INTERSECTED with this — a supervisor can
+    // never query outside their own team.
+    const scopeIds = await subtreeAshaIds(req.user);
+    const scopeSet = new Set(scopeIds);
     if (req.query.worker) {
-      filter.ashaId = req.query.worker;
+      filter.ashaId = scopeSet.has(req.query.worker) ? req.query.worker : null;
     } else if (req.query.district || req.query.block) {
       const workerFilter = {};
       if (req.query.district) {
@@ -1794,9 +1898,10 @@ app.get('/api/admin/reports', auth, adminOnly, async (req, res) => {
         workerFilter.block = { $regex: `^${escapeRegex(req.query.block)}$`, $options: 'i' };
       }
       const workers = await User.find(workerFilter).select('_id');
-      const ids = workers.map(w => w._id);
-      // If no workers match, scope to empty set (no reports) rather than ignoring filter
+      const ids = workers.map(w => w._id.toString()).filter(id => scopeSet.has(id));
       filter.ashaId = ids.length ? { $in: ids } : null;
+    } else {
+      filter.ashaId = scopeIds.length ? { $in: scopeIds } : null;
     }
 
     const reports = await Report.find(filter).sort({ createdAt: -1 });
@@ -1810,9 +1915,10 @@ app.get('/api/admin/reports', auth, adminOnly, async (req, res) => {
 // Lists every report where deletedAt is set, sorted by most-recent deletion.
 // Populated with worker name so admin can see who deleted what. Used by the
 // admin panel's "Deleted reports" view — clinical records must be auditable.
-app.get('/api/admin/reports/deleted', auth, adminOnly, async (req, res) => {
+app.get('/api/admin/reports/deleted', auth, requireSupervisor, async (req, res) => {
   try {
-    const reports = await Report.find({ deletedAt: { $ne: null } })
+    const scopeIds = await subtreeAshaIds(req.user);
+    const reports = await Report.find({ deletedAt: { $ne: null }, ashaId: { $in: scopeIds } })
       .sort({ deletedAt: -1 })
       .populate('ashaId', 'name district block');
     res.json({
@@ -1837,14 +1943,17 @@ app.get('/api/admin/reports/deleted', auth, adminOnly, async (req, res) => {
 // Clears deletedAt on any report (regardless of which worker owns it).
 // Distinct from the worker /api/reports/:id/restore route which is
 // ashaId-scoped — admin can restore reports across workers.
-app.patch('/api/admin/reports/:id/restore', auth, adminOnly, async (req, res) => {
+app.patch('/api/admin/reports/:id/restore', auth, requireSupervisor, async (req, res) => {
   try {
+    const existing = await Report.findById(req.params.id).select('ashaId');
+    if (!existing) return res.status(404).json({ success: false, message: 'Report not found' });
+    if (!(await inSubtree(req.user, existing.ashaId)))
+      return res.status(403).json({ success: false, message: 'Not in your team' });
     const report = await Report.findByIdAndUpdate(
       req.params.id,
       { deletedAt: null },
       { new: true },
     );
-    if (!report) return res.status(404).json({ success: false, message: 'Report not found' });
     res.json({ success: true, data: toClient(report) });
   } catch (err) {
     res.status(500).json({ success: false, message: err.message });
@@ -1856,10 +1965,12 @@ app.patch('/api/admin/reports/:id/restore', auth, adminOnly, async (req, res) =>
 // that are already soft-deleted (deletedAt is set) — that's the policy
 // "audit first, then erase" so a worker's accidental delete can be
 // permanent only after an admin reviews it.
-app.delete('/api/admin/reports/:id/permanent', auth, adminOnly, async (req, res) => {
+app.delete('/api/admin/reports/:id/permanent', auth, requireSupervisor, async (req, res) => {
   try {
     const report = await Report.findById(req.params.id);
     if (!report) return res.status(404).json({ success: false, message: 'Report not found' });
+    if (!(await inSubtree(req.user, report.ashaId)))
+      return res.status(403).json({ success: false, message: 'Not in your team' });
     if (!report.deletedAt) {
       return res.status(400).json({
         success: false,
@@ -1878,11 +1989,13 @@ function escapeRegex(s) {
 }
 
 // ── Distinct districts and blocks (for admin filter dropdown population) ─────
-app.get('/api/admin/locations', auth, adminOnly, async (_req, res) => {
+app.get('/api/admin/locations', auth, requireSupervisor, async (req, res) => {
   try {
+    // Only the districts/blocks present within the requester's own subtree.
+    const ids = await subtreeUserIds(req.user.id);
     const [districts, blocks] = await Promise.all([
-      User.distinct('district', { district: { $nin: [null, ''] } }),
-      User.distinct('block',    { block:    { $nin: [null, ''] } }),
+      User.distinct('district', { _id: { $in: ids }, district: { $nin: [null, ''] } }),
+      User.distinct('block',    { _id: { $in: ids }, block:    { $nin: [null, ''] } }),
     ]);
     res.json({ success: true, data: { districts: districts.sort(), blocks: blocks.sort() } });
   } catch (err) {
@@ -1890,39 +2003,42 @@ app.get('/api/admin/locations', auth, adminOnly, async (_req, res) => {
   }
 });
 
-app.get('/api/admin/stats', auth, adminOnly, async (req, res) => {
+app.get('/api/admin/stats', auth, requireSupervisor, async (req, res) => {
   try {
-    const workerQuery = { $or: [{ isAdmin: false }, { role: 'asha_worker' }], isActive: true };
+    // Everything is scoped to the ASHAs in the requester's own subtree.
+    const scopeIds = await subtreeAshaIds(req.user);
+    const A = { ashaId: { $in: scopeIds } };
     const [
       totalWorkers, totalPatients, totalReports, redReports, yellowReports, greenReports,
-      // ── Module aggregates (across all ASHAs) ──
+      // ── Module aggregates (within the subtree) ──
       ncdScreened, ncdHighRisk,
       tbPresumptive, tbOnTreatment,
       medLowStock,
       vitalPendingCrs,
       referralOpen,
     ] = await Promise.all([
-      User.countDocuments(workerQuery),
-      Patient.countDocuments(),
-      Report.countDocuments(),
-      Report.countDocuments({ finalBand: 'RED' }),
-      Report.countDocuments({ finalBand: 'YELLOW' }),
-      Report.countDocuments({ finalBand: 'GREEN' }),
+      Promise.resolve(scopeIds.length),
+      Patient.countDocuments(A),
+      Report.countDocuments(A),
+      Report.countDocuments({ ...A, finalBand: 'RED' }),
+      Report.countDocuments({ ...A, finalBand: 'YELLOW' }),
+      Report.countDocuments({ ...A, finalBand: 'GREEN' }),
       // NCD/CBAC: total screened + high-risk (score ≥ 4 or any symptom)
-      NcdCbac.countDocuments(),
-      NcdCbac.countDocuments({ $or: [{ riskScore: { $gte: 4 } }, { 'symptoms.0': { $exists: true } }] }),
+      NcdCbac.countDocuments(A),
+      NcdCbac.countDocuments({ ...A, $or: [{ riskScore: { $gte: 4 } }, { 'symptoms.0': { $exists: true } }] }),
       // TB: presumptive (screening) + currently on DOTS
-      TbCase.countDocuments({ stage: 'presumptive' }),
-      TbCase.countDocuments({ stage: 'on_treatment' }),
+      TbCase.countDocuments({ ...A, stage: 'presumptive' }),
+      TbCase.countDocuments({ ...A, stage: 'on_treatment' }),
       // Medicine stock: lines running low (threshold set & closing ≤ threshold)
       MedicineStock.countDocuments({
+        ...A,
         lowStockThreshold: { $gt: 0 },
         $expr: { $lte: ['$closingStock', '$lowStockThreshold'] },
       }),
       // Vital events: births/deaths not yet registered with CRS
-      VitalEvent.countDocuments({ registered: { $ne: true } }),
+      VitalEvent.countDocuments({ ...A, registered: { $ne: true } }),
       // Referrals still open (not completed)
-      Referral.countDocuments({ status: { $nin: ['completed', 'closed'] } }),
+      Referral.countDocuments({ ...A, status: { $nin: ['completed', 'closed'] } }),
     ]);
     res.json({
       success: true,
@@ -1944,8 +2060,10 @@ app.get('/api/admin/stats', auth, adminOnly, async (req, res) => {
 
 // ── Admin — per-worker data ───────────────────────────────────────────────────
 
-app.get('/api/admin/workers/:id/patients', auth, adminOnly, async (req, res) => {
+app.get('/api/admin/workers/:id/patients', auth, requireSupervisor, async (req, res) => {
   try {
+    if (!(await inSubtree(req.user, req.params.id)))
+      return res.status(403).json({ success: false, message: 'Not in your team' });
     const patients = await Patient.find({ ashaId: req.params.id }).sort({ createdAt: -1 });
     res.json({ success: true, data: patients.map(toClient) });
   } catch (err) {
@@ -1953,8 +2071,10 @@ app.get('/api/admin/workers/:id/patients', auth, adminOnly, async (req, res) => 
   }
 });
 
-app.get('/api/admin/workers/:id/reports', auth, adminOnly, async (req, res) => {
+app.get('/api/admin/workers/:id/reports', auth, requireSupervisor, async (req, res) => {
   try {
+    if (!(await inSubtree(req.user, req.params.id)))
+      return res.status(403).json({ success: false, message: 'Not in your team' });
     const reports = await Report.find({ ashaId: req.params.id }).sort({ createdAt: -1 });
     res.json({ success: true, data: reports.map(toClient) });
   } catch (err) {
@@ -1962,11 +2082,26 @@ app.get('/api/admin/workers/:id/reports', auth, adminOnly, async (req, res) => {
   }
 });
 
-app.get('/api/admin/workers/:id/profile', auth, adminOnly, async (req, res) => {
+app.get('/api/admin/workers/:id/profile', auth, requireSupervisor, async (req, res) => {
   try {
+    if (!(await inSubtree(req.user, req.params.id)))
+      return res.status(403).json({ success: false, message: 'Not in your team' });
     const user = await User.findById(req.params.id).select('-otp -otpExpiry');
     if (!user) return res.status(404).json({ success: false, message: 'Worker not found' });
     res.json({ success: true, data: toClient(user) });
+  } catch (err) {
+    res.status(500).json({ success: false, message: err.message });
+  }
+});
+
+// Direct reports of a specific member of my subtree — powers drilling down the
+// tree (BMHO taps an ANM → sees that ANM's ASHAs, and so on).
+app.get('/api/admin/workers/:id/team', auth, requireSupervisor, async (req, res) => {
+  try {
+    if (!(await inSubtree(req.user, req.params.id)))
+      return res.status(403).json({ success: false, message: 'Not in your team' });
+    const team = await User.find({ supervisorId: req.params.id }).select('-otp -otpExpiry');
+    res.json({ success: true, data: team.map(toClient) });
   } catch (err) {
     res.status(500).json({ success: false, message: err.message });
   }
