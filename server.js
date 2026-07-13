@@ -1795,7 +1795,78 @@ app.get('/api/admin/workers', auth, requireSupervisor, async (req, res) => {
   try {
     // The level directly below the requester: ANM→ASHAs, BMHO→ANMs, CMHO→BMHOs.
     const workers = await directReports(req.user);
-    res.json({ success: true, data: workers.map(toClient) });
+
+    // Enrich each row with the aggregate that makes the list usable: for a
+    // supervisor child it's their WHOLE subtree (so a BMHO sees how big each
+    // ANM's team is and how active it is); for an ASHA it's her own numbers.
+    const data = await Promise.all(workers.map(async (w) => {
+      const obj = toClient(w);
+      const wid = w._id.toString();
+      const isLeaf = effectiveRole(w) === 'asha_worker';
+      const ashaIds = isLeaf ? [wid] : await subtreeAshaIds({ id: wid });
+      obj.teamSize = isLeaf ? 0 : ashaIds.length;
+
+      const A = { ashaId: { $in: ashaIds } };
+      const [patientCount, reportCount, redCount] = await Promise.all([
+        Patient.countDocuments(A),
+        Report.countDocuments({
+          ...A,
+          $or: [{ deletedAt: null }, { deletedAt: { $exists: false } }],
+        }),
+        Report.countDocuments({ ...A, finalBand: 'RED' }),
+      ]);
+      obj.patientCount = patientCount;
+      obj.reportCount = reportCount;
+      obj.redCount = redCount;
+      return obj;
+    }));
+
+    res.json({ success: true, data });
+  } catch (err) {
+    res.status(500).json({ success: false, message: err.message });
+  }
+});
+
+// Members at my child-level who aren't attached to anyone yet. This is how an
+// existing ANM (orphaned by the migration) gets slotted under a newly created
+// BMHO — without it the tree could never be assembled above the ANM.
+app.get('/api/admin/unassigned', auth, requireSupervisor, async (req, res) => {
+  try {
+    const childRole = CHILD_ROLE[effectiveRole(req.user)];
+    if (!childRole) return res.json({ success: true, data: [] });
+    const list = await User.find({
+      role: childRole,
+      $or: [{ supervisorId: null }, { supervisorId: { $exists: false } }],
+    }).select('-otp -otpExpiry');
+    res.json({ success: true, data: list.map(toClient) });
+  } catch (err) {
+    res.status(500).json({ success: false, message: err.message });
+  }
+});
+
+// Re-parent a member (adopt an unassigned one, or move someone already inside
+// my subtree). Guardrails: you may only touch someone who is unattached or
+// already yours, and the new supervisor must be you or someone in your subtree
+// — so a BMHO can never poach out of another block.
+app.patch('/api/admin/workers/:id/supervisor', auth, requireSupervisor, async (req, res) => {
+  try {
+    const { supervisorId } = req.body;
+    if (!supervisorId)
+      return res.status(400).json({ success: false, message: 'supervisorId required' });
+    if (supervisorId.toString() === req.params.id.toString())
+      return res.status(400).json({ success: false, message: 'Cannot report to self' });
+
+    const target = await User.findById(req.params.id).select('supervisorId');
+    if (!target) return res.status(404).json({ success: false, message: 'User not found' });
+
+    const isOrphan = !target.supervisorId;
+    if (!isOrphan && !(await inSubtree(req.user, req.params.id)))
+      return res.status(403).json({ success: false, message: 'Not in your team' });
+    if (!(await inSubtree(req.user, supervisorId)))
+      return res.status(403).json({ success: false, message: 'Target supervisor not in your team' });
+
+    await User.findByIdAndUpdate(req.params.id, { supervisorId });
+    res.json({ success: true });
   } catch (err) {
     res.status(500).json({ success: false, message: err.message });
   }
