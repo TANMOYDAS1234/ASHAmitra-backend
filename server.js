@@ -863,7 +863,7 @@ app.get('/health', (_, res) => {
     success: true,
     message: 'AshaMitra backend is running',
     version: '1.0.0',
-    build: 'gemini-primary+lang-normalize+mch-schedule+reminders+ocr+remindlog+hbyc+aadhaarqr2+patientversionfix+agegenderfix+editlegacyversionfix+dobschedguard+identitydedup+referrals+pncschedule+watemplate+eligiblecouples+vitalevents+ecaadhaar+ancplan+ancwindow+reminderhealth+msg91sms+ncdcbac+tbcases+medstock+ancwb+missweekly+adminmodstats+hierarchy-roles-2026-07',
+    build: 'gemini-primary+lang-normalize+mch-schedule+reminders+ocr+remindlog+hbyc+aadhaarqr2+patientversionfix+agegenderfix+editlegacyversionfix+dobschedguard+identitydedup+referrals+pncschedule+watemplate+eligiblecouples+vitalevents+ecaadhaar+ancplan+ancwindow+reminderhealth+msg91sms+ncdcbac+tbcases+medstock+ancwb+missweekly+adminmodstats+hierarchy-roles+district-hmis-2026-07',
     ocr: !!tesseract,
     qr: !!(Jimp && jsQR), // Aadhaar QR engine loaded? (false ⇒ npm i jimp jsqr on VPS)
     chatPrimary: 'gemini', // resolveChatReply tries Gemini first, Groq fallback
@@ -2121,6 +2121,207 @@ app.get('/api/admin/stats', auth, requireSupervisor, async (req, res) => {
           medLowStock,
           vitalPendingCrs,
           referralOpen,
+        },
+      },
+    });
+  } catch (err) {
+    res.status(500).json({ success: false, message: err.message });
+  }
+});
+
+// ── District analytics — the CMHO's dashboard ────────────────────────────────
+// Indicators follow the government's own HMIS key-indicator formulas. A CMHO
+// cross-checks these against the HMIS portal, so a tile whose percentage
+// disagrees destroys trust in the whole panel — hence the denominators here are
+// deliberately MoHFW's (e.g. LBW% is over births WITH a recorded weight, not all
+// births; institutional-delivery% is over total reported births).
+//
+// A percentage is null — never 0 — when there is no denominator, so the UI can
+// show "—" instead of a confident, wrong zero.
+//
+// Everything is scoped to the caller's subtree and then broken down BY BLOCK,
+// because district → block is the accountability axis a CMHO actually manages on.
+app.get('/api/admin/district', auth, requireSupervisor, async (req, res) => {
+  try {
+    const months = Math.max(1, Math.min(24, Number(req.query.months) || 12));
+    const since = new Date();
+    since.setMonth(since.getMonth() - months);
+    const now = new Date();
+    const d30 = new Date(Date.now() - 30 * 86400000);
+
+    const ashaIds = await subtreeAshaIds(req.user);
+    if (!ashaIds.length) {
+      return res.json({
+        success: true,
+        data: {
+          periodMonths: months, indicators: {}, blocks: [],
+          alerts: { maternalDeaths: [], infantDeaths: [], stockouts: [], silentAshas: [], overdueReferrals: [] },
+        },
+      });
+    }
+
+    const ashaDocs = await User.find({ _id: { $in: ashaIds } })
+      .select('_id name block isActive').lean();
+    const blockOf = new Map(ashaDocs.map(a => [String(a._id), a.block || 'অজানা']));
+    const nameOf  = new Map(ashaDocs.map(a => [String(a._id), a.name || '—']));
+    const A = { ashaId: { $in: ashaIds } };
+
+    const [births, deaths, pregnancies, ancDone, vac, pncDone, referrals, lowStock, activeEvents, reports] =
+      await Promise.all([
+        VitalEvent.find({ ...A, eventType: 'birth', eventDate: { $gte: since } }).lean(),
+        VitalEvent.find({ ...A, eventType: 'death', eventDate: { $gte: since } }).lean(),
+        Patient.find({ ...A, type: { $regex: /^pregnan/i } })
+          .select('_id ashaId lmp createdAt mcpDetails').lean(),
+        ScheduleEvent.find({ ...A, kind: 'anc', status: 'done' }).select('patientId ashaId').lean(),
+        ScheduleEvent.find({ ...A, kind: 'vaccine' }).select('ashaId status windowEnd dueDate').lean(),
+        ScheduleEvent.find({ ...A, kind: { $in: ['hbnc', 'pnc'] }, status: 'done' }).select('ashaId').lean(),
+        Referral.find({ ...A }).select('ashaId status band createdAt patientName village').lean(),
+        MedicineStock.find({
+          ...A, lowStockThreshold: { $gt: 0 },
+          $expr: { $lte: ['$closingStock', '$lowStockThreshold'] },
+        }).select('ashaId medicineName closingStock lowStockThreshold').lean(),
+        ScheduleEvent.find({ ...A, status: 'done', doneDate: { $gte: d30 } }).select('ashaId').lean(),
+        Report.find({
+          ...A, createdAt: { $gte: since },
+          $or: [{ deletedAt: null }, { deletedAt: { $exists: false } }],
+        }).select('ashaId finalBand').lean(),
+      ]);
+
+    const pct = (n, d) => (d > 0 ? Math.round((n / d) * 1000) / 10 : null);
+    const kg = (s) => {
+      const v = parseFloat(String(s || '').replace(/[^0-9.]/g, ''));
+      return Number.isFinite(v) && v > 0 ? v : null;
+    };
+
+    const blocks = new Map();
+    const B = (id) => {
+      const b = blockOf.get(String(id)) || 'অজানা';
+      if (!blocks.has(b)) {
+        blocks.set(b, {
+          block: b, ashas: 0, births: 0, institutional: 0, caesarean: 0,
+          lbw: 0, lbwWeighed: 0, maternalDeaths: 0, infantDeaths: 0,
+          vacDone: 0, vacOverdue: 0, reports: 0, red: 0,
+        });
+      }
+      return blocks.get(b);
+    };
+    for (const a of ashaDocs) B(a._id).ashas++;
+
+    // Births → institutional delivery, C-section, SBA attendance, LBW.
+    let nBirths = 0, inst = 0, cs = 0, sba = 0, lbw = 0, weighed = 0;
+    for (const b of births) {
+      nBirths++; const blk = B(b.ashaId); blk.births++;
+      if (b.place === 'institution') { inst++; blk.institutional++; }
+      if (b.deliveryType === 'caesarean') { cs++; blk.caesarean++; }
+      if (['doctor', 'anm', 'sba'].includes(b.attendedBy)) sba++;
+      const w = kg(b.birthWeight);
+      if (w !== null) { weighed++; blk.lbwWeighed++; if (w < 2.5) { lbw++; blk.lbw++; } }
+    }
+
+    // Deaths → MDSR / CDR. These are the CMHO's hardest escalations.
+    const maternalDeaths = deaths.filter(d => d.maternalDeath);
+    const infantDeaths = deaths.filter(d => d.infantDeath);
+    for (const d of maternalDeaths) B(d.ashaId).maternalDeaths++;
+    for (const d of infantDeaths) B(d.ashaId).infantDeaths++;
+
+    // ANC → 1st-trimester registration and 4+ visits, per HMIS.
+    const ancPerPatient = new Map();
+    for (const e of ancDone) {
+      const k = String(e.patientId);
+      ancPerPatient.set(k, (ancPerPatient.get(k) || 0) + 1);
+    }
+    let anc4 = 0, firstTri = 0, highRisk = 0;
+    for (const p of pregnancies) {
+      if ((ancPerPatient.get(String(p._id)) || 0) >= 4) anc4++;
+      if (p.lmp && p.createdAt) {
+        const wks = (new Date(p.createdAt) - new Date(p.lmp)) / (7 * 86400000);
+        if (wks >= 0 && wks < 12) firstTri++;
+      }
+      if (p.mcpDetails && p.mcpDetails.highRisk === true) highRisk++;
+    }
+
+    // Immunization → coverage and defaulters (pending past the clinical window).
+    let vacDone = 0, vacOverdue = 0;
+    for (const e of vac) {
+      const blk = B(e.ashaId);
+      if (e.status === 'done') { vacDone++; blk.vacDone++; }
+      else if (e.status === 'pending') {
+        const end = e.windowEnd || e.dueDate;
+        if (end && new Date(end) < now) { vacOverdue++; blk.vacOverdue++; }
+      }
+    }
+
+    for (const r of reports) {
+      const blk = B(r.ashaId); blk.reports++;
+      if (String(r.finalBand).toUpperCase() === 'RED') blk.red++;
+    }
+
+    // "Silent" ASHAs — no completed visit in 30 days. HMIS calls the facility
+    // equivalent zero-reporting; it's the first thing a CMHO chases.
+    const activeSet = new Set(activeEvents.map(e => String(e.ashaId)));
+    const silentAshas = ashaDocs
+      .filter(a => a.isActive !== false && !activeSet.has(String(a._id)))
+      .map(a => ({ id: String(a._id), name: a.name || '—', block: a.block || 'অজানা' }));
+
+    // Referrals that never reached a facility — the community→facility black box.
+    const openReferrals = referrals.filter(r => !['reached', 'completed', 'cancelled'].includes(r.status));
+    const overdueReferrals = openReferrals
+      .filter(r => r.createdAt && now - new Date(r.createdAt) > 7 * 86400000)
+      .map(r => ({
+        patientName: r.patientName || '—', village: r.village || '', band: r.band || '',
+        days: Math.floor((now - new Date(r.createdAt)) / 86400000),
+        block: blockOf.get(String(r.ashaId)) || 'অজানা',
+      }))
+      .sort((a, b) => b.days - a.days);
+
+    res.json({
+      success: true,
+      data: {
+        periodMonths: months,
+        indicators: {
+          ashas: ashaDocs.length,
+          pregnanciesRegistered: pregnancies.length,
+          ancFirstTrimesterPct: pct(firstTri, pregnancies.length),
+          anc4PlusPct: pct(anc4, pregnancies.length),
+          highRiskPregnancies: highRisk,
+          births: nBirths,
+          institutionalDeliveryPct: pct(inst, nBirths),
+          cSectionPct: pct(cs, nBirths),
+          sbaAttendedPct: pct(sba, nBirths),
+          lbwPct: pct(lbw, weighed),
+          lbwWeighed: weighed,
+          immunizationCoveragePct: pct(vacDone, vacDone + vacOverdue),
+          immunizationDefaulters: vacOverdue,
+          pncVisits: pncDone.length,
+          maternalDeaths: maternalDeaths.length,
+          infantDeaths: infantDeaths.length,
+          referralClosurePct: pct(
+            referrals.filter(r => ['reached', 'completed'].includes(r.status)).length,
+            referrals.length),
+          openReferrals: openReferrals.length,
+        },
+        blocks: [...blocks.values()].map(b => ({
+          ...b,
+          institutionalPct: pct(b.institutional, b.births),
+          lbwPct: pct(b.lbw, b.lbwWeighed),
+          immunizationPct: pct(b.vacDone, b.vacDone + b.vacOverdue),
+        })).sort((x, y) => y.reports - x.reports),
+        alerts: {
+          maternalDeaths: maternalDeaths.map(d => ({
+            name: d.personName || '—', village: d.village || '', date: d.eventDate,
+            cause: d.causeOfDeath || '', block: blockOf.get(String(d.ashaId)) || 'অজানা',
+          })),
+          infantDeaths: infantDeaths.map(d => ({
+            name: d.personName || '—', village: d.village || '', date: d.eventDate,
+            age: d.ageAtDeath || '', block: blockOf.get(String(d.ashaId)) || 'অজানা',
+          })),
+          stockouts: lowStock.map(s => ({
+            medicine: s.medicineName, left: s.closingStock, threshold: s.lowStockThreshold,
+            asha: nameOf.get(String(s.ashaId)) || '—',
+            block: blockOf.get(String(s.ashaId)) || 'অজানা',
+          })),
+          silentAshas,
+          overdueReferrals,
         },
       },
     });
