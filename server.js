@@ -70,6 +70,9 @@ const userSchema = new mongoose.Schema({
   isAdmin:          { type: Boolean, default: false },
   isActive:         { type: Boolean, default: true },
   profileImagePath: { type: String, default: null },
+  // FCM device tokens. An array, not a single field: an ANM may carry a phone
+  // and use a tablet, and a RED alert must reach both.
+  fcmTokens:        { type: [String], default: [] },
   otp:              String,
   otpExpiry:        Date,
 }, { timestamps: true });
@@ -495,8 +498,105 @@ async function notifySupervisors(workerId, { type, title, body, link = '', data 
     await Notification.insertMany(active.map(u => ({
       recipientId: u._id, type, title, body, link, data,
     })));
+    // The whole point of push: a RED emergency reaches her ANM → BMHO → CMHO in
+    // seconds, instead of surfacing on reporting day.
+    sendPush(active.map(u => u._id), { title, body, link });
   } catch (e) {
     console.error('[notifySupervisors]', e.message);
+  }
+}
+
+// ── Push (Firebase Cloud Messaging, HTTP v1) ─────────────────────────────────
+// No firebase-admin, no google-auth-library, no npm install on the server: a
+// service account is just an RSA key, so the OAuth assertion is minted with
+// `jsonwebtoken` (already a dependency) and sent with Node's built-in fetch.
+//
+// Env-gated exactly like SMS/WhatsApp: the notification is ALWAYS written to the
+// DB and shown in the in-app bell. Push is a DELIVERY BONUS on top — if FCM is
+// not configured, nothing sends and nothing breaks.
+const fcmReady = () =>
+  !!(process.env.FCM_PROJECT_ID && process.env.FCM_CLIENT_EMAIL && process.env.FCM_PRIVATE_KEY);
+
+let _fcmAuth = null; // { token, exp } — Google's tokens last an hour; don't re-mint per push.
+async function fcmAccessToken() {
+  if (_fcmAuth && _fcmAuth.exp > Date.now() + 60_000) return _fcmAuth.token;
+
+  // The .env keeps the key on ONE line with literal \n. Restore real newlines,
+  // or the RS256 sign will fail with an unhelpful "invalid key" error.
+  const key = (process.env.FCM_PRIVATE_KEY || '').replace(/\\n/g, '\n');
+  const now = Math.floor(Date.now() / 1000);
+  const assertion = jwt.sign(
+    {
+      iss: process.env.FCM_CLIENT_EMAIL,
+      scope: 'https://www.googleapis.com/auth/firebase.messaging',
+      aud: 'https://oauth2.googleapis.com/token',
+      iat: now,
+      exp: now + 3600,
+    },
+    key,
+    { algorithm: 'RS256' },
+  );
+
+  const res = await fetch('https://oauth2.googleapis.com/token', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: new URLSearchParams({
+      grant_type: 'urn:ietf:params:oauth:grant-type:jwt-bearer',
+      assertion,
+    }),
+  });
+  const j = await res.json();
+  if (!j.access_token) {
+    throw new Error(`auth failed: ${j.error_description || j.error || res.status}`);
+  }
+  _fcmAuth = { token: j.access_token, exp: Date.now() + (j.expires_in || 3600) * 1000 };
+  return _fcmAuth.token;
+}
+
+// Deliver to every device the given users have registered. Dead tokens are
+// PRUNED — otherwise they pile up forever and every future send wastes a request
+// on a phone that was wiped months ago.
+async function sendPush(userIds, { title, body, link = '' }) {
+  if (!fcmReady() || !userIds || !userIds.length) return;
+  try {
+    const users = await User.find({ _id: { $in: userIds }, isActive: true })
+      .select('_id fcmTokens').lean();
+    const pairs = [];
+    for (const u of users) {
+      for (const t of (u.fcmTokens || [])) pairs.push([String(u._id), t]);
+    }
+    if (!pairs.length) return;
+
+    const access = await fcmAccessToken();
+    const url = `https://fcm.googleapis.com/v1/projects/${process.env.FCM_PROJECT_ID}/messages:send`;
+
+    await Promise.all(pairs.map(async ([uid, token]) => {
+      try {
+        const r = await fetch(url, {
+          method: 'POST',
+          headers: { Authorization: `Bearer ${access}`, 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            message: {
+              token,
+              notification: { title, body },
+              data: { link: String(link || '') },
+              android: {
+                priority: 'HIGH', // a RED case must wake the phone, not wait for a sync window
+                notification: { channel_id: 'ashamitra_alerts' },
+              },
+            },
+          }),
+        });
+        // 404 UNREGISTERED / 400 invalid — app uninstalled or token rotated.
+        if (r.status === 404 || r.status === 400) {
+          await User.updateOne({ _id: uid }, { $pull: { fcmTokens: token } });
+        }
+      } catch (_) {
+        // One dead device must never sink the delivery to the others.
+      }
+    }));
+  } catch (e) {
+    console.error('[push]', e.message);
   }
 }
 
@@ -504,6 +604,7 @@ async function notifyUser({ recipientId, type, title, body, link = '', data = {}
   try {
     if (!recipientId) return;
     await Notification.create({ recipientId, type, title, body, link, data });
+    sendPush([recipientId], { title, body, link }); // fire-and-forget
   } catch (e) {
     console.error('[notifyUser]', e.message);
   }
@@ -897,7 +998,7 @@ app.get('/health', (_, res) => {
     success: true,
     message: 'AshaMitra backend is running',
     version: '1.0.0',
-    build: 'gemini-primary+lang-normalize+mch-schedule+reminders+ocr+remindlog+hbyc+aadhaarqr2+patientversionfix+agegenderfix+editlegacyversionfix+dobschedguard+identitydedup+referrals+pncschedule+watemplate+eligiblecouples+vitalevents+ecaadhaar+ancplan+ancwindow+reminderhealth+msg91sms+ncdcbac+tbcases+medstock+ancwb+missweekly+adminmodstats+hierarchy-roles+district-hmis+teamrollup+defaulters+chainalerts+periodfix-2026-07',
+    build: 'gemini-primary+lang-normalize+mch-schedule+reminders+ocr+remindlog+hbyc+aadhaarqr2+patientversionfix+agegenderfix+editlegacyversionfix+dobschedguard+identitydedup+referrals+pncschedule+watemplate+eligiblecouples+vitalevents+ecaadhaar+ancplan+ancwindow+reminderhealth+msg91sms+ncdcbac+tbcases+medstock+ancwb+missweekly+adminmodstats+hierarchy-roles+district-hmis+teamrollup+defaulters+chainalerts+periodfix+fcmpush-2026-07',
     ocr: !!tesseract,
     qr: !!(Jimp && jsQR), // Aadhaar QR engine loaded? (false ⇒ npm i jimp jsqr on VPS)
     chatPrimary: 'gemini', // resolveChatReply tries Gemini first, Groq fallback
@@ -908,6 +1009,7 @@ app.get('/health', (_, res) => {
       cron: true, // scan scheduled (boot+hourly)
       sms: !!(process.env.SMS_API_KEY && process.env.SMS_TEMPLATE_ID), // MSG91 flow
       whatsapp: !!(process.env.WHATSAPP_TOKEN && process.env.WHATSAPP_PHONE_ID),
+      push: fcmReady(), // FCM configured? (booleans only — never the key)
     },
     db: {
       name: c && c.name ? c.name : null,
@@ -977,6 +1079,67 @@ app.post('/api/auth/verify-otp', async (req, res) => {
     });
   } catch (err) {
     res.status(500).json({ success: false, message: err.message });
+  }
+});
+
+// ── Push: device registration ────────────────────────────────────────────────
+// Called after login and whenever FCM rotates the token. $addToSet, so a device
+// re-registering on every app start doesn't grow the array without bound.
+app.post('/api/auth/fcm-token', auth, async (req, res) => {
+  try {
+    const { token } = req.body;
+    if (!token) return res.status(400).json({ success: false, message: 'token required' });
+    await User.updateOne({ _id: req.user.id }, { $addToSet: { fcmTokens: token } });
+    res.json({ success: true, push: fcmReady() });
+  } catch (err) {
+    res.status(500).json({ success: false, message: err.message });
+  }
+});
+
+// Detach a device on logout. These phones get shared and handed over; without
+// this, the next RED alert for the old worker would light up on a device that
+// now belongs to someone else.
+app.delete('/api/auth/fcm-token', auth, async (req, res) => {
+  try {
+    const { token } = req.body;
+    if (!token) return res.status(400).json({ success: false, message: 'token required' });
+    await User.updateOne({ _id: req.user.id }, { $pull: { fcmTokens: token } });
+    res.json({ success: true });
+  } catch (err) {
+    res.status(500).json({ success: false, message: err.message });
+  }
+});
+
+// Fire a test push at my own devices. Proves the entire chain — service account
+// → OAuth token → FCM v1 → the handset — without waiting for a real emergency,
+// and reports WHY it failed rather than silently doing nothing.
+app.post('/api/auth/test-push', auth, async (req, res) => {
+  try {
+    if (!fcmReady()) {
+      return res.status(400).json({
+        success: false,
+        message: 'FCM not configured — set FCM_PROJECT_ID / FCM_CLIENT_EMAIL / FCM_PRIVATE_KEY in .env and restart',
+      });
+    }
+    const me = await User.findById(req.user.id).select('fcmTokens').lean();
+    const devices = (me && me.fcmTokens ? me.fcmTokens : []).length;
+    if (!devices) {
+      return res.status(400).json({
+        success: false,
+        message: 'No device registered for this account — open the app once so it can register its token',
+      });
+    }
+    // Surface auth failures instead of swallowing them: a bad private key is the
+    // single most common setup error, and a silent no-op teaches you nothing.
+    await fcmAccessToken();
+    await sendPush([req.user.id], {
+      title: 'AshaMitra — টেস্ট',
+      body: 'পুশ নোটিফিকেশন কাজ করছে ✅',
+      link: '/home',
+    });
+    res.json({ success: true, devices });
+  } catch (err) {
+    res.status(500).json({ success: false, message: `FCM: ${err.message}` });
   }
 });
 
