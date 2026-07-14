@@ -2182,8 +2182,13 @@ app.get('/api/admin/district', auth, requireSupervisor, async (req, res) => {
     const months = Math.max(1, Math.min(24, Number(req.query.months) || 12));
     const since = new Date();
     since.setMonth(since.getMonth() - months);
+    // The equivalent window immediately before this one — the baseline for
+    // "are we improving?".
+    const prevSince = new Date(since);
+    prevSince.setMonth(prevSince.getMonth() - months);
     const now = new Date();
     const d30 = new Date(Date.now() - 30 * 86400000);
+    const inPrev = (d) => d && d >= prevSince && d < since;
 
     const ashaIds = await subtreeAshaIds(req.user);
     if (!ashaIds.length) {
@@ -2224,7 +2229,8 @@ app.get('/api/admin/district', auth, requireSupervisor, async (req, res) => {
         // Pregnancies REGISTERED in the window. Previously this was every
         // pregnancy ever, so the header said "last 12 months" while the number
         // was lifetime — and switching 12mo→3mo changed nothing.
-        Patient.find({ ...A, type: { $regex: /^pregnan/i }, createdAt: { $gte: since } })
+        // Fetched back to prevSince so the previous window is free (no 2nd query).
+        Patient.find({ ...A, type: { $regex: /^pregnan/i }, createdAt: { $gte: prevSince } })
           .select('_id ashaId lmp createdAt mcpDetails').lean(),
         // All completed ANC (needed to know how many a woman has had), but with
         // doneDate so the 4th visit is attributed to the period it happened in —
@@ -2331,23 +2337,31 @@ app.get('/api/admin/district', auth, requireSupervisor, async (req, res) => {
       if (!ancDates.has(k)) ancDates.set(k, []);
       ancDates.get(k).push(new Date(e.doneDate));
     }
-    let anc4 = 0;
+    let anc4 = 0, anc4Prev = 0;
     for (const [, dates] of ancDates) {
       if (dates.length < 4) continue;
       dates.sort((a, b) => a - b);
       const fourth = dates[3]; // her 4th ANC
       if (fourth >= since) anc4++; // …happened inside this window
+      else if (inPrev(fourth)) anc4Prev++; // …or the one before it
     }
 
-    // Registration-side indicators, over women REGISTERED in the window.
-    let firstTri = 0, highRisk = 0;
-    for (const p of pregnancies) {
-      if (p.lmp && p.createdAt) {
-        const wks = (new Date(p.createdAt) - new Date(p.lmp)) / (7 * 86400000);
-        if (wks >= 0 && wks < 12) firstTri++;
-      }
-      if (p.mcpDetails && p.mcpDetails.highRisk === true) highRisk++;
-    }
+    // The pregnancy query reaches back TWO windows so the baseline costs no
+    // extra round-trip; split it here.
+    const pregNow = pregnancies.filter(
+      p => p.createdAt && new Date(p.createdAt) >= since);
+    const pregPrev = pregnancies.filter(
+      p => p.createdAt && inPrev(new Date(p.createdAt)));
+
+    const firstTriOf = (list) => list.filter(p => {
+      if (!p.lmp || !p.createdAt) return false;
+      const wks = (new Date(p.createdAt) - new Date(p.lmp)) / (7 * 86400000);
+      return wks >= 0 && wks < 12;
+    }).length;
+
+    const firstTri = firstTriOf(pregNow);
+    const highRisk = pregNow.filter(
+      p => p.mcpDetails && p.mcpDetails.highRisk === true).length;
 
     // Immunization → coverage and defaulters (pending past the clinical window).
     // Coverage is period-scoped: of the doses that came DUE inside this window,
@@ -2356,6 +2370,7 @@ app.get('/api/admin/district', auth, requireSupervisor, async (req, res) => {
     // year just because the window is 3 months would be the worst kind of
     // reassuring lie.
     let vacDue = 0, vacDone = 0, vacOverdue = 0;
+    let vacDuePrev = 0, vacDonePrev = 0; // baseline window
     const defaulterRows = []; // the actual children, not just the count
     for (const e of vac) {
       const due = e.dueDate ? new Date(e.dueDate) : null;
@@ -2366,6 +2381,9 @@ app.get('/api/admin/district', auth, requireSupervisor, async (req, res) => {
           vacDone++;
           both(e.ashaId, r => r.vacDone++);
         }
+      } else if (inPrev(due)) {
+        vacDuePrev++;
+        if (e.status === 'done') vacDonePrev++;
       }
       if (e.status === 'pending') {
         const end = e.windowEnd || e.dueDate;
@@ -2397,11 +2415,8 @@ app.get('/api/admin/district', auth, requireSupervisor, async (req, res) => {
 
     // ── Previous equivalent window ─────────────────────────────────────────
     // "Are we improving?" is the question a monthly review actually asks, and a
-    // snapshot cannot answer it. Only birth/death-derived indicators go here:
-    // they are cleanly event-dated, so a like-for-like comparison is honest.
-    const prevSince = new Date(since);
-    prevSince.setMonth(prevSince.getMonth() - months);
-
+    // snapshot cannot answer it. Births/deaths need their own query; everything
+    // else is derived from rows already fetched, so the baseline is nearly free.
     const [prevBirths, prevDeaths] = await Promise.all([
       VitalEvent.find({ ...A, eventType: 'birth', eventDate: { $gte: prevSince, $lt: since } })
         .select('place deliveryType attendedBy birthWeight').lean(),
@@ -2427,6 +2442,14 @@ app.get('/api/admin/district', auth, requireSupervisor, async (req, res) => {
       lbwPct: pct(qLbw, qWeighed),
       maternalDeaths: prevDeaths.filter(d => d.maternalDeath).length,
       infantDeaths: prevDeaths.filter(d => d.infantDeath).length,
+      // Derived from rows already in memory — no extra query.
+      pregnanciesRegistered: pregPrev.length,
+      ancFirstTrimesterPct: pct(firstTriOf(pregPrev), pregPrev.length),
+      anc4PlusPct: pct(anc4Prev, pregPrev.length),
+      highRiskPregnancies: pregPrev.filter(
+        p => p.mcpDetails && p.mcpDetails.highRisk === true).length,
+      immunizationCoveragePct: pct(vacDonePrev, vacDuePrev),
+      referralClosurePct: pct(closed(prevWindow), prevWindow.length),
     };
 
     // "Silent" ASHAs — no completed visit in 30 days. HMIS calls the facility
@@ -2437,11 +2460,14 @@ app.get('/api/admin/district', auth, requireSupervisor, async (req, res) => {
       .map(a => ({ id: String(a._id), name: a.name || '—', block: a.block || 'অজানা' }));
 
     // Closure is measured on referrals RAISED inside the window…
+    const closed = (list) =>
+      list.filter(r => ['reached', 'completed'].includes(r.status)).length;
     const inWindow = referrals.filter(
       r => r.createdAt && new Date(r.createdAt) >= since);
+    const prevWindow = referrals.filter(
+      r => r.createdAt && inPrev(new Date(r.createdAt)));
     const refsRaised = inWindow.length;
-    const refsClosed =
-      inWindow.filter(r => ['reached', 'completed'].includes(r.status)).length;
+    const refsClosed = closed(inWindow);
 
     // …but "still stranded" is a snapshot of NOW. A referral open for 400 days
     // must not disappear from the alert just because the window is 3 months.
@@ -2461,9 +2487,12 @@ app.get('/api/admin/district', auth, requireSupervisor, async (req, res) => {
         periodMonths: months,
         indicators: {
           ashas: ashaDocs.length,
-          pregnanciesRegistered: pregnancies.length,
-          ancFirstTrimesterPct: pct(firstTri, pregnancies.length),
-          anc4PlusPct: pct(anc4, pregnancies.length),
+          // pregNow, NOT pregnancies — the query deliberately spans this window
+          // AND the baseline one, so using the raw list here would compute this
+          // period's rates over a doubled denominator.
+          pregnanciesRegistered: pregNow.length,
+          ancFirstTrimesterPct: pct(firstTri, pregNow.length),
+          anc4PlusPct: pct(anc4, pregNow.length),
           highRiskPregnancies: highRisk,
           births: nBirths,
           institutionalDeliveryPct: pct(inst, nBirths),
