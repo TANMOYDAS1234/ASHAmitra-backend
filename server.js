@@ -45,6 +45,35 @@ async function migrateHierarchy() {
         { $set: { supervisorId: anm._id } });
       console.log(`Hierarchy migration ok — ${r.modifiedCount ?? 0} ASHAs linked under ANM ${anm._id}`);
     }
+
+    // Attach dangling SUPERVISORS to the tree. The block above promotes a legacy
+    // admin to 'anm' but never gives her a supervisorId, so she ends up outside
+    // the hierarchy entirely: invisible to her BMHO's team view, and — much worse
+    // — supervisorChain() walks UP via supervisorId, so a RED alert from one of
+    // her ASHAs escalates to her and then stops dead. The BMHO and CMHO never
+    // hear about it, and nothing anywhere says so.
+    //
+    // Only auto-link when the parent is unambiguous (exactly one candidate).
+    // Guessing a parent in a real multi-block district would silently misroute
+    // escalations, which is the same class of bug in the opposite direction.
+    for (const [childRole, parentRole] of [['anm', 'bmho'], ['bmho', 'cmho']]) {
+      const orphans = await User.countDocuments({
+        role: childRole,
+        $or: [{ supervisorId: null }, { supervisorId: { $exists: false } }],
+      });
+      if (!orphans) continue;
+      const parents = await User.find({ role: parentRole }).select('_id').lean();
+      if (parents.length === 1) {
+        const r = await User.updateMany(
+          { role: childRole, $or: [{ supervisorId: null }, { supervisorId: { $exists: false } }] },
+          { $set: { supervisorId: parents[0]._id } });
+        console.log(`Hierarchy migration — linked ${r.modifiedCount ?? 0} ${childRole} under ${parentRole} ${parents[0]._id}`);
+      } else {
+        console.warn(
+          `[hierarchy] ${orphans} ${childRole}(s) have NO supervisor and ${parents.length} ${parentRole}s exist — ` +
+          `cannot pick one safely. Until they are linked, RED alerts from their teams will NOT escalate past them.`);
+      }
+    }
   } catch (e) {
     console.error('Hierarchy migration failed:', e.message);
   }
