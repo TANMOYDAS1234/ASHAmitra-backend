@@ -556,8 +556,21 @@ async function fcmAccessToken() {
 // Deliver to every device the given users have registered. Dead tokens are
 // PRUNED — otherwise they pile up forever and every future send wastes a request
 // on a phone that was wiped months ago.
+// A token is only DEAD for these two reasons. Everything else — a malformed
+// payload, a quota trip, an FCM outage — is our problem, not the phone's.
+//
+// Pruning on a bare HTTP 400 (which is what this used to do) is actively
+// dangerous: FCM answers 400 INVALID_ARGUMENT when the *message* is wrong, so a
+// single bad payload would silently delete every device token in the district
+// and take the whole escalation chain down with it, with nothing in the UI to
+// say so. Key off FCM's errorCode, never the bare status.
+const FCM_DEAD_TOKEN = new Set(['UNREGISTERED', 'INVALID_ARGUMENT_TOKEN', 'SENDER_ID_MISMATCH']);
+
+// Returns a summary so callers that care (test-push) can report what actually
+// happened. Fire-and-forget callers can keep ignoring it.
 async function sendPush(userIds, { title, body, link = '' }) {
-  if (!fcmReady() || !userIds || !userIds.length) return;
+  const out = { sent: 0, failed: 0, pruned: 0, errors: [] };
+  if (!fcmReady() || !userIds || !userIds.length) return out;
   try {
     const users = await User.find({ _id: { $in: userIds }, isActive: true })
       .select('_id fcmTokens').lean();
@@ -565,7 +578,7 @@ async function sendPush(userIds, { title, body, link = '' }) {
     for (const u of users) {
       for (const t of (u.fcmTokens || [])) pairs.push([String(u._id), t]);
     }
-    if (!pairs.length) return;
+    if (!pairs.length) return out;
 
     const access = await fcmAccessToken();
     const url = `https://fcm.googleapis.com/v1/projects/${process.env.FCM_PROJECT_ID}/messages:send`;
@@ -587,17 +600,41 @@ async function sendPush(userIds, { title, body, link = '' }) {
             },
           }),
         });
-        // 404 UNREGISTERED / 400 invalid — app uninstalled or token rotated.
-        if (r.status === 404 || r.status === 400) {
+        if (r.ok) { out.sent++; return; }
+
+        const text = await r.text();
+        let code = '';
+        try {
+          const j = JSON.parse(text);
+          const details = (j.error && j.error.details) || [];
+          code = (details.find(d => d.errorCode) || {}).errorCode
+              || (j.error && j.error.status) || '';
+        } catch (_) { /* non-JSON error body — keep the raw text below */ }
+
+        out.failed++;
+        out.errors.push({ status: r.status, code, detail: text.slice(0, 300) });
+        console.error('[push] send failed', r.status, code, text.slice(0, 300));
+
+        // Prune on the errorCode ONLY — never on a bare 404. If FCM_PROJECT_ID is
+        // wrong the request URL itself 404s, and reading that as "this phone is
+        // dead" would delete every healthy token in the district on the first
+        // send. A misconfigured server must fail loudly, not quietly disarm the
+        // escalation chain.
+        if (FCM_DEAD_TOKEN.has(code)) {
           await User.updateOne({ _id: uid }, { $pull: { fcmTokens: token } });
+          out.pruned++;
         }
-      } catch (_) {
+      } catch (e) {
         // One dead device must never sink the delivery to the others.
+        out.failed++;
+        out.errors.push({ status: 0, code: 'NETWORK', detail: e.message });
       }
     }));
   } catch (e) {
     console.error('[push]', e.message);
+    out.errors.push({ status: 0, code: 'FATAL', detail: e.message });
   }
+  return out;
 }
 
 async function notifyUser({ recipientId, type, title, body, link = '', data = {} }) {
@@ -1132,12 +1169,27 @@ app.post('/api/auth/test-push', auth, async (req, res) => {
     // Surface auth failures instead of swallowing them: a bad private key is the
     // single most common setup error, and a silent no-op teaches you nothing.
     await fcmAccessToken();
-    await sendPush([req.user.id], {
+    const r = await sendPush([req.user.id], {
       title: 'AshaMitra — টেস্ট',
       body: 'পুশ নোটিফিকেশন কাজ করছে ✅',
       link: '/home',
     });
-    res.json({ success: true, devices });
+    // AWAIT the result and report it. This endpoint exists to diagnose push, so
+    // answering "success" the moment the request was dispatched — before FCM has
+    // said whether it accepted the token — is worse than useless: it reports
+    // green while the handset gets nothing.
+    if (!r.sent) {
+      const e = r.errors[0] || {};
+      return res.status(502).json({
+        success: false,
+        devices,
+        fcm: r,
+        message: e.code
+          ? `FCM rejected the send: ${e.code}${r.pruned ? ' (token removed)' : ''}`
+          : 'FCM accepted no devices',
+      });
+    }
+    res.json({ success: true, devices, sent: r.sent, failed: r.failed });
   } catch (err) {
     res.status(500).json({ success: false, message: `FCM: ${err.message}` });
   }
@@ -2597,6 +2649,20 @@ app.get('/api/admin/district', auth, requireSupervisor, async (req, res) => {
       if (w !== null) { qWeighed++; if (w < 2.5) qLbw++; }
     }
 
+    // Closure is measured on referrals RAISED inside the window…
+    // Declared BEFORE `prev` below, which calls closed(prevWindow): `const` is
+    // hoisted but left uninitialized, so using either one line earlier throws
+    // "Cannot access 'closed' before initialization" and takes the entire
+    // district route — the whole CMHO dashboard — down with it.
+    const closed = (list) =>
+      list.filter(r => ['reached', 'completed'].includes(r.status)).length;
+    const inWindow = referrals.filter(
+      r => r.createdAt && new Date(r.createdAt) >= since);
+    const prevWindow = referrals.filter(
+      r => r.createdAt && inPrev(new Date(r.createdAt)));
+    const refsRaised = inWindow.length;
+    const refsClosed = closed(inWindow);
+
     const prev = {
       births: qB,
       institutionalDeliveryPct: pct(qInst, qB),
@@ -2621,16 +2687,6 @@ app.get('/api/admin/district', auth, requireSupervisor, async (req, res) => {
     const silentAshas = ashaDocs
       .filter(a => a.isActive !== false && !activeSet.has(String(a._id)))
       .map(a => ({ id: String(a._id), name: a.name || '—', block: a.block || 'অজানা' }));
-
-    // Closure is measured on referrals RAISED inside the window…
-    const closed = (list) =>
-      list.filter(r => ['reached', 'completed'].includes(r.status)).length;
-    const inWindow = referrals.filter(
-      r => r.createdAt && new Date(r.createdAt) >= since);
-    const prevWindow = referrals.filter(
-      r => r.createdAt && inPrev(new Date(r.createdAt)));
-    const refsRaised = inWindow.length;
-    const refsClosed = closed(inWindow);
 
     // …but "still stranded" is a snapshot of NOW. A referral open for 400 days
     // must not disappear from the alert just because the window is 3 months.
