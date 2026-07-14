@@ -863,7 +863,7 @@ app.get('/health', (_, res) => {
     success: true,
     message: 'AshaMitra backend is running',
     version: '1.0.0',
-    build: 'gemini-primary+lang-normalize+mch-schedule+reminders+ocr+remindlog+hbyc+aadhaarqr2+patientversionfix+agegenderfix+editlegacyversionfix+dobschedguard+identitydedup+referrals+pncschedule+watemplate+eligiblecouples+vitalevents+ecaadhaar+ancplan+ancwindow+reminderhealth+msg91sms+ncdcbac+tbcases+medstock+ancwb+missweekly+adminmodstats+hierarchy-roles+district-hmis-2026-07',
+    build: 'gemini-primary+lang-normalize+mch-schedule+reminders+ocr+remindlog+hbyc+aadhaarqr2+patientversionfix+agegenderfix+editlegacyversionfix+dobschedguard+identitydedup+referrals+pncschedule+watemplate+eligiblecouples+vitalevents+ecaadhaar+ancplan+ancwindow+reminderhealth+msg91sms+ncdcbac+tbcases+medstock+ancwb+missweekly+adminmodstats+hierarchy-roles+district-hmis+teamrollup-2026-07',
     ocr: !!tesseract,
     qr: !!(Jimp && jsQR), // Aadhaar QR engine loaded? (false ⇒ npm i jimp jsqr on VPS)
     chatPrimary: 'gemini', // resolveChatReply tries Gemini first, Groq fallback
@@ -2166,6 +2166,21 @@ app.get('/api/admin/district', auth, requireSupervisor, async (req, res) => {
     const nameOf  = new Map(ashaDocs.map(a => [String(a._id), a.name || '—']));
     const A = { ashaId: { $in: ashaIds } };
 
+    // Attribute every ASHA to the DIRECT REPORT they roll up under, so the same
+    // indicators can rank the level immediately below the caller. Blocks are the
+    // CMHO's axis, but a BMHO's whole subtree IS one block — he needs his ANMs
+    // ranked, and an ANM needs her ASHAs. Same accountability, one level down.
+    const directs = await directReports(req.user);
+    const ownerOf = new Map(); // ashaId → direct-report id
+    const teamMeta = new Map(); // direct-report id → { name, role }
+    for (const d of directs) {
+      const did = String(d._id);
+      teamMeta.set(did, { name: d.name || '—', role: effectiveRole(d) });
+      const leaf = effectiveRole(d) === 'asha_worker';
+      const ids = leaf ? [did] : await subtreeAshaIds({ id: did });
+      for (const a of ids) ownerOf.set(String(a), did);
+    }
+
     const [births, deaths, pregnancies, ancDone, vac, pncDone, referrals, lowStock, activeEvents, reports] =
       await Promise.all([
         VitalEvent.find({ ...A, eventType: 'birth', eventDate: { $gte: since } }).lean(),
@@ -2205,24 +2220,52 @@ app.get('/api/admin/district', auth, requireSupervisor, async (req, res) => {
       }
       return blocks.get(b);
     };
-    for (const a of ashaDocs) B(a._id).ashas++;
+    // Per-direct-report accumulator — the same shape as the block one.
+    const team = new Map();
+    const T = (id) => {
+      const owner = ownerOf.get(String(id));
+      if (!owner) return null;
+      if (!team.has(owner)) {
+        const m = teamMeta.get(owner) || { name: '—', role: '' };
+        team.set(owner, {
+          id: owner, name: m.name, role: m.role,
+          ashas: 0, births: 0, institutional: 0, caesarean: 0,
+          lbw: 0, lbwWeighed: 0, maternalDeaths: 0, infantDeaths: 0,
+          vacDone: 0, vacOverdue: 0, reports: 0, red: 0,
+        });
+      }
+      return team.get(owner);
+    };
+
+    // Apply one increment to BOTH rollups, so block and team can never drift.
+    const both = (ashaId, fn) => {
+      const b = B(ashaId); if (b) fn(b);
+      const t = T(ashaId); if (t) fn(t);
+    };
+
+    for (const a of ashaDocs) both(a._id, r => r.ashas++);
 
     // Births → institutional delivery, C-section, SBA attendance, LBW.
     let nBirths = 0, inst = 0, cs = 0, sba = 0, lbw = 0, weighed = 0;
     for (const b of births) {
-      nBirths++; const blk = B(b.ashaId); blk.births++;
-      if (b.place === 'institution') { inst++; blk.institutional++; }
-      if (b.deliveryType === 'caesarean') { cs++; blk.caesarean++; }
+      nBirths++;
+      both(b.ashaId, r => r.births++);
+      if (b.place === 'institution') { inst++; both(b.ashaId, r => r.institutional++); }
+      if (b.deliveryType === 'caesarean') { cs++; both(b.ashaId, r => r.caesarean++); }
       if (['doctor', 'anm', 'sba'].includes(b.attendedBy)) sba++;
       const w = kg(b.birthWeight);
-      if (w !== null) { weighed++; blk.lbwWeighed++; if (w < 2.5) { lbw++; blk.lbw++; } }
+      if (w !== null) {
+        weighed++;
+        both(b.ashaId, r => r.lbwWeighed++);
+        if (w < 2.5) { lbw++; both(b.ashaId, r => r.lbw++); }
+      }
     }
 
     // Deaths → MDSR / CDR. These are the CMHO's hardest escalations.
     const maternalDeaths = deaths.filter(d => d.maternalDeath);
     const infantDeaths = deaths.filter(d => d.infantDeath);
-    for (const d of maternalDeaths) B(d.ashaId).maternalDeaths++;
-    for (const d of infantDeaths) B(d.ashaId).infantDeaths++;
+    for (const d of maternalDeaths) both(d.ashaId, r => r.maternalDeaths++);
+    for (const d of infantDeaths) both(d.ashaId, r => r.infantDeaths++);
 
     // ANC → 1st-trimester registration and 4+ visits, per HMIS.
     const ancPerPatient = new Map();
@@ -2243,17 +2286,23 @@ app.get('/api/admin/district', auth, requireSupervisor, async (req, res) => {
     // Immunization → coverage and defaulters (pending past the clinical window).
     let vacDone = 0, vacOverdue = 0;
     for (const e of vac) {
-      const blk = B(e.ashaId);
-      if (e.status === 'done') { vacDone++; blk.vacDone++; }
-      else if (e.status === 'pending') {
+      if (e.status === 'done') {
+        vacDone++;
+        both(e.ashaId, r => r.vacDone++);
+      } else if (e.status === 'pending') {
         const end = e.windowEnd || e.dueDate;
-        if (end && new Date(end) < now) { vacOverdue++; blk.vacOverdue++; }
+        if (end && new Date(end) < now) {
+          vacOverdue++;
+          both(e.ashaId, r => r.vacOverdue++);
+        }
       }
     }
 
-    for (const r of reports) {
-      const blk = B(r.ashaId); blk.reports++;
-      if (String(r.finalBand).toUpperCase() === 'RED') blk.red++;
+    for (const rep of reports) {
+      both(rep.ashaId, r => r.reports++);
+      if (String(rep.finalBand).toUpperCase() === 'RED') {
+        both(rep.ashaId, r => r.red++);
+      }
     }
 
     // "Silent" ASHAs — no completed visit in 30 days. HMIS calls the facility
@@ -2305,6 +2354,15 @@ app.get('/api/admin/district', auth, requireSupervisor, async (req, res) => {
           institutionalPct: pct(b.institutional, b.births),
           lbwPct: pct(b.lbw, b.lbwWeighed),
           immunizationPct: pct(b.vacDone, b.vacDone + b.vacOverdue),
+        })).sort((x, y) => y.reports - x.reports),
+        // The level directly below the caller, same indicators. This is what
+        // makes the BMHO and ANM panels real: a BMHO ranks his ANMs, an ANM
+        // ranks her ASHAs — blocks are only meaningful to a CMHO.
+        team: [...team.values()].map(t => ({
+          ...t,
+          institutionalPct: pct(t.institutional, t.births),
+          lbwPct: pct(t.lbw, t.lbwWeighed),
+          immunizationPct: pct(t.vacDone, t.vacDone + t.vacOverdue),
         })).sort((x, y) => y.reports - x.reports),
         alerts: {
           maternalDeaths: maternalDeaths.map(d => ({
