@@ -466,6 +466,40 @@ async function notifyAllAdmins({ type, title, body, link = '', data = {} }) {
   }
 }
 
+// Everyone ABOVE a worker in the supervisor tree: her ANM, that ANM's BMHO, and
+// so on to the CMHO. Walks upward, guarding against a cycle.
+async function supervisorChain(userId) {
+  const chain = [];
+  const seen = new Set([String(userId)]);
+  let cur = await User.findById(userId).select('supervisorId');
+  while (cur && cur.supervisorId && !seen.has(String(cur.supervisorId))) {
+    const sup = String(cur.supervisorId);
+    seen.add(sup);
+    chain.push(sup);
+    cur = await User.findById(sup).select('supervisorId');
+  }
+  return chain;
+}
+
+// Escalate UP the chain above the worker who raised it — NOT to every admin.
+// Before the hierarchy existed, "all admins" was one person and notifyAllAdmins
+// was correct. Now it would ping an ANM in another block about a patient she
+// cannot act on and has no business seeing: alert fatigue plus a scoping leak.
+// The people who can actually act are exactly her supervisors.
+async function notifySupervisors(workerId, { type, title, body, link = '', data = {} }) {
+  try {
+    const ids = await supervisorChain(workerId);
+    if (!ids.length) return;
+    const active = await User.find({ _id: { $in: ids }, isActive: true }).select('_id');
+    if (!active.length) return;
+    await Notification.insertMany(active.map(u => ({
+      recipientId: u._id, type, title, body, link, data,
+    })));
+  } catch (e) {
+    console.error('[notifySupervisors]', e.message);
+  }
+}
+
 async function notifyUser({ recipientId, type, title, body, link = '', data = {} }) {
   try {
     if (!recipientId) return;
@@ -863,7 +897,7 @@ app.get('/health', (_, res) => {
     success: true,
     message: 'AshaMitra backend is running',
     version: '1.0.0',
-    build: 'gemini-primary+lang-normalize+mch-schedule+reminders+ocr+remindlog+hbyc+aadhaarqr2+patientversionfix+agegenderfix+editlegacyversionfix+dobschedguard+identitydedup+referrals+pncschedule+watemplate+eligiblecouples+vitalevents+ecaadhaar+ancplan+ancwindow+reminderhealth+msg91sms+ncdcbac+tbcases+medstock+ancwb+missweekly+adminmodstats+hierarchy-roles+district-hmis+teamrollup+defaulters-2026-07',
+    build: 'gemini-primary+lang-normalize+mch-schedule+reminders+ocr+remindlog+hbyc+aadhaarqr2+patientversionfix+agegenderfix+editlegacyversionfix+dobschedguard+identitydedup+referrals+pncschedule+watemplate+eligiblecouples+vitalevents+ecaadhaar+ancplan+ancwindow+reminderhealth+msg91sms+ncdcbac+tbcases+medstock+ancwb+missweekly+adminmodstats+hierarchy-roles+district-hmis+teamrollup+defaulters+chainalerts-2026-07',
     ocr: !!tesseract,
     qr: !!(Jimp && jsQR), // Aadhaar QR engine loaded? (false ⇒ npm i jimp jsqr on VPS)
     chatPrimary: 'gemini', // resolveChatReply tries Gemini first, Groq fallback
@@ -1651,8 +1685,10 @@ app.post('/api/reports', auth, async (req, res) => {
         link: '/reports',
         data,
       });
-      // All admins — high-priority alert
-      notifyAllAdmins({
+      // Escalate up HER chain only — ANM → BMHO → CMHO. Not every admin in the
+      // district: an ANM in another block cannot act on this and should not see
+      // the patient.
+      notifySupervisors(req.user.id, {
         type: 'red_band',
         title: 'RED band case reported',
         body:  `${patientStr} · ${caseLabel}`,
