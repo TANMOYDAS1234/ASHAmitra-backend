@@ -1224,6 +1224,36 @@ app.post('/api/auth/test-push', auth, async (req, res) => {
   }
 });
 
+// ── Who am I ─────────────────────────────────────────────────────────────────
+// The app caches the user object at login and the JWT lives for 30 days, so
+// without this the cached copy can be a month stale. That is exactly what bit
+// the pilot CMHO: her session was saved BEFORE roles existed, so the app fell
+// back to "isAdmin => anm" and showed her the ANM panel — for a district officer.
+// Promote an ANM to BMHO and she'd likewise keep the old panel until she happened
+// to log out. The app re-reads this on every launch. Same shape as verify-otp's
+// `user`, so both paths hydrate the model identically.
+app.get('/api/auth/me', auth, async (req, res) => {
+  try {
+    const user = await User.findById(req.user.id);
+    if (!user) return res.status(404).json({ success: false, message: 'User not found' });
+    res.json({
+      success: true,
+      user: {
+        id: user._id.toString(), phone: user.phone, name: user.name,
+        role: effectiveRole(user),
+        supervisorId: user.supervisorId ? user.supervisorId.toString() : null,
+        subCentre: user.subCentre ?? '',
+        block: user.block, district: user.district,
+        isAdmin: user.isAdmin,
+        isActive: user.isActive,
+        profileImagePath: user.profileImagePath ?? null,
+      },
+    });
+  } catch (err) {
+    res.status(500).json({ success: false, message: err.message });
+  }
+});
+
 // ── Profile update ───────────────────────────────────────────────────────────
 
 app.put('/api/auth/profile', auth, async (req, res) => {
