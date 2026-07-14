@@ -2155,6 +2155,12 @@ app.get('/api/readiness/summary', auth, requireSupervisor, async (req, res) => {
     const low = new Map();        // code -> count
     const blocks = new Map();     // block -> rollup
 
+    // item × block, so the district can be SEEN rather than read. A CMHO should
+    // be able to spot "MgSO4 is red across three blocks" in one glance, which no
+    // list of counts will ever give her.
+    const matrix = new Map();     // block -> code -> { ok, low, out }
+    const askedCodes = new Set(); // only render rows someone in this subtree is asked
+
     let reported = 0, stale = 0, never = 0;
 
     for (const p of people) {
@@ -2164,14 +2170,20 @@ app.get('/api/readiness/summary', auth, requireSupervisor, async (req, res) => {
       const asked = READINESS_ITEMS.some(i => i.roles.includes(role));
       if (!asked) continue;
 
+      for (const i of READINESS_ITEMS) {
+        if (i.roles.includes(role)) askedCodes.add(i.code);
+      }
+
       const blockKey = p.block || 'অজানা';
       if (!blocks.has(blockKey)) {
         blocks.set(blockKey, {
           block: blockKey, criticalOut: 0, low: 0,
           reported: 0, stale: 0, never: 0, units: [],
         });
+        matrix.set(blockKey, {});
       }
       const B = blocks.get(blockKey);
+      const M = matrix.get(blockKey);
 
       const doc = byPerson.get(String(p._id));
       const ageMs = doc ? now - new Date(doc.createdAt).getTime() : null;
@@ -2197,6 +2209,8 @@ app.get('/api/readiness/summary', auth, requireSupervisor, async (req, res) => {
         for (const it of (doc.items || [])) {
           const meta = READINESS_BY_CODE[it.code];
           if (!meta) continue;
+          if (!M[it.code]) M[it.code] = { ok: 0, low: 0, out: 0 };
+          M[it.code][it.status] = (M[it.code][it.status] || 0) + 1;
           if (it.status === 'out' && meta.critical) {
             unit.criticalOut.push(it.code);
             B.criticalOut++;
@@ -2235,6 +2249,17 @@ app.get('/api/readiness/summary', auth, requireSupervisor, async (req, res) => {
         blocks: [...blocks.values()]
           .map(b => ({ ...b, units: b.units.sort((x, y) => y.criticalOut.length - x.criticalOut.length) }))
           .sort((a, b) => b.criticalOut - a.criticalOut),
+
+        // Rows of the heatmap. Critical items first, then by catalogue order, so
+        // the eye lands on MgSO4 and oxytocin before it reaches the thermometer.
+        items: READINESS_ITEMS
+          .filter(i => askedCodes.has(i.code))
+          .sort((a, b) => (b.critical ? 1 : 0) - (a.critical ? 1 : 0))
+          .map(({ code, bn, cat, critical }) => ({ code, bn, cat, critical })),
+
+        // Columns × rows. A cell with no counts is UNKNOWN, not OK — the app
+        // renders it grey, never green.
+        matrix: [...matrix.entries()].map(([block, cells]) => ({ block, cells })),
       },
     });
   } catch (err) {
