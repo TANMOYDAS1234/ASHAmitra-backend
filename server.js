@@ -897,7 +897,7 @@ app.get('/health', (_, res) => {
     success: true,
     message: 'AshaMitra backend is running',
     version: '1.0.0',
-    build: 'gemini-primary+lang-normalize+mch-schedule+reminders+ocr+remindlog+hbyc+aadhaarqr2+patientversionfix+agegenderfix+editlegacyversionfix+dobschedguard+identitydedup+referrals+pncschedule+watemplate+eligiblecouples+vitalevents+ecaadhaar+ancplan+ancwindow+reminderhealth+msg91sms+ncdcbac+tbcases+medstock+ancwb+missweekly+adminmodstats+hierarchy-roles+district-hmis+teamrollup+defaulters+chainalerts-2026-07',
+    build: 'gemini-primary+lang-normalize+mch-schedule+reminders+ocr+remindlog+hbyc+aadhaarqr2+patientversionfix+agegenderfix+editlegacyversionfix+dobschedguard+identitydedup+referrals+pncschedule+watemplate+eligiblecouples+vitalevents+ecaadhaar+ancplan+ancwindow+reminderhealth+msg91sms+ncdcbac+tbcases+medstock+ancwb+missweekly+adminmodstats+hierarchy-roles+district-hmis+teamrollup+defaulters+chainalerts+periodfix-2026-07',
     ocr: !!tesseract,
     qr: !!(Jimp && jsQR), // Aadhaar QR engine loaded? (false ⇒ npm i jimp jsqr on VPS)
     chatPrimary: 'gemini', // resolveChatReply tries Gemini first, Groq fallback
@@ -2221,14 +2221,26 @@ app.get('/api/admin/district', auth, requireSupervisor, async (req, res) => {
       await Promise.all([
         VitalEvent.find({ ...A, eventType: 'birth', eventDate: { $gte: since } }).lean(),
         VitalEvent.find({ ...A, eventType: 'death', eventDate: { $gte: since } }).lean(),
-        Patient.find({ ...A, type: { $regex: /^pregnan/i } })
+        // Pregnancies REGISTERED in the window. Previously this was every
+        // pregnancy ever, so the header said "last 12 months" while the number
+        // was lifetime — and switching 12mo→3mo changed nothing.
+        Patient.find({ ...A, type: { $regex: /^pregnan/i }, createdAt: { $gte: since } })
           .select('_id ashaId lmp createdAt mcpDetails').lean(),
-        ScheduleEvent.find({ ...A, kind: 'anc', status: 'done' }).select('patientId ashaId').lean(),
+        // All completed ANC (needed to know how many a woman has had), but with
+        // doneDate so the 4th visit is attributed to the period it happened in —
+        // HMIS counts EVENTS in a month, not lifetime cohorts.
+        ScheduleEvent.find({ ...A, kind: 'anc', status: 'done' })
+          .select('patientId ashaId doneDate').lean(),
         // Carry the patient identity too: an officer cannot act on the number
         // "13" — they need to know WHO is overdue, for what, and whose ASHA.
         ScheduleEvent.find({ ...A, kind: 'vaccine' })
           .select('ashaId status windowEnd dueDate label patientId patientName patientMobile').lean(),
-        ScheduleEvent.find({ ...A, kind: { $in: ['hbnc', 'pnc'] }, status: 'done' }).select('ashaId').lean(),
+        // PNC/HBNC visits DONE in the window (not every one ever performed).
+        ScheduleEvent.find({ ...A, kind: { $in: ['hbnc', 'pnc'] }, status: 'done', doneDate: { $gte: since } })
+          .select('ashaId').lean(),
+        // All referrals: closure % is computed over those RAISED in the window,
+        // but "still stranded" must stay a snapshot of NOW — a referral that has
+        // been open 400 days must not vanish because the window is 3 months.
         Referral.find({ ...A }).select('ashaId status band createdAt patientName village').lean(),
         MedicineStock.find({
           ...A, lowStockThreshold: { $gt: 0 },
@@ -2254,7 +2266,7 @@ app.get('/api/admin/district', auth, requireSupervisor, async (req, res) => {
         blocks.set(b, {
           block: b, ashas: 0, births: 0, institutional: 0, caesarean: 0,
           lbw: 0, lbwWeighed: 0, maternalDeaths: 0, infantDeaths: 0,
-          vacDone: 0, vacOverdue: 0, reports: 0, red: 0,
+          vacDue: 0, vacDone: 0, vacOverdue: 0, reports: 0, red: 0,
         });
       }
       return blocks.get(b);
@@ -2270,7 +2282,7 @@ app.get('/api/admin/district', auth, requireSupervisor, async (req, res) => {
           id: owner, name: m.name, role: m.role,
           ashas: 0, births: 0, institutional: 0, caesarean: 0,
           lbw: 0, lbwWeighed: 0, maternalDeaths: 0, infantDeaths: 0,
-          vacDone: 0, vacOverdue: 0, reports: 0, red: 0,
+          vacDue: 0, vacDone: 0, vacOverdue: 0, reports: 0, red: 0,
         });
       }
       return team.get(owner);
@@ -2307,14 +2319,29 @@ app.get('/api/admin/district', auth, requireSupervisor, async (req, res) => {
     for (const d of infantDeaths) both(d.ashaId, r => r.infantDeaths++);
 
     // ANC → 1st-trimester registration and 4+ visits, per HMIS.
-    const ancPerPatient = new Map();
+    //
+    // HMIS derives "PW given 4+ ANC" as an EVENT counted in the reporting month:
+    // the woman's 4th check-up happened in this window. It is not a cohort
+    // follow-up of women registered in the window (a woman registered in month 1
+    // gets her 4th visit in month 8 — a cohort reading would report ~0%).
+    const ancDates = new Map(); // patientId → [doneDate, …]
     for (const e of ancDone) {
+      if (!e.doneDate) continue;
       const k = String(e.patientId);
-      ancPerPatient.set(k, (ancPerPatient.get(k) || 0) + 1);
+      if (!ancDates.has(k)) ancDates.set(k, []);
+      ancDates.get(k).push(new Date(e.doneDate));
     }
-    let anc4 = 0, firstTri = 0, highRisk = 0;
+    let anc4 = 0;
+    for (const [, dates] of ancDates) {
+      if (dates.length < 4) continue;
+      dates.sort((a, b) => a - b);
+      const fourth = dates[3]; // her 4th ANC
+      if (fourth >= since) anc4++; // …happened inside this window
+    }
+
+    // Registration-side indicators, over women REGISTERED in the window.
+    let firstTri = 0, highRisk = 0;
     for (const p of pregnancies) {
-      if ((ancPerPatient.get(String(p._id)) || 0) >= 4) anc4++;
       if (p.lmp && p.createdAt) {
         const wks = (new Date(p.createdAt) - new Date(p.lmp)) / (7 * 86400000);
         if (wks >= 0 && wks < 12) firstTri++;
@@ -2323,13 +2350,24 @@ app.get('/api/admin/district', auth, requireSupervisor, async (req, res) => {
     }
 
     // Immunization → coverage and defaulters (pending past the clinical window).
-    let vacDone = 0, vacOverdue = 0;
+    // Coverage is period-scoped: of the doses that came DUE inside this window,
+    // how many were actually given? Defaulters are deliberately NOT — "who is
+    // overdue" is a snapshot of NOW, and hiding a child who fell overdue last
+    // year just because the window is 3 months would be the worst kind of
+    // reassuring lie.
+    let vacDue = 0, vacDone = 0, vacOverdue = 0;
     const defaulterRows = []; // the actual children, not just the count
     for (const e of vac) {
-      if (e.status === 'done') {
-        vacDone++;
-        both(e.ashaId, r => r.vacDone++);
-      } else if (e.status === 'pending') {
+      const due = e.dueDate ? new Date(e.dueDate) : null;
+      if (due && due >= since) {
+        vacDue++;
+        both(e.ashaId, r => r.vacDue++);
+        if (e.status === 'done') {
+          vacDone++;
+          both(e.ashaId, r => r.vacDone++);
+        }
+      }
+      if (e.status === 'pending') {
         const end = e.windowEnd || e.dueDate;
         if (end && new Date(end) < now) {
           vacOverdue++;
@@ -2357,6 +2395,40 @@ app.get('/api/admin/district', auth, requireSupervisor, async (req, res) => {
       }
     }
 
+    // ── Previous equivalent window ─────────────────────────────────────────
+    // "Are we improving?" is the question a monthly review actually asks, and a
+    // snapshot cannot answer it. Only birth/death-derived indicators go here:
+    // they are cleanly event-dated, so a like-for-like comparison is honest.
+    const prevSince = new Date(since);
+    prevSince.setMonth(prevSince.getMonth() - months);
+
+    const [prevBirths, prevDeaths] = await Promise.all([
+      VitalEvent.find({ ...A, eventType: 'birth', eventDate: { $gte: prevSince, $lt: since } })
+        .select('place deliveryType attendedBy birthWeight').lean(),
+      VitalEvent.find({ ...A, eventType: 'death', eventDate: { $gte: prevSince, $lt: since } })
+        .select('maternalDeath infantDeath').lean(),
+    ]);
+
+    let qB = 0, qInst = 0, qCs = 0, qSba = 0, qLbw = 0, qWeighed = 0;
+    for (const b of prevBirths) {
+      qB++;
+      if (b.place === 'institution') qInst++;
+      if (b.deliveryType === 'caesarean') qCs++;
+      if (['doctor', 'anm', 'sba'].includes(b.attendedBy)) qSba++;
+      const w = kg(b.birthWeight);
+      if (w !== null) { qWeighed++; if (w < 2.5) qLbw++; }
+    }
+
+    const prev = {
+      births: qB,
+      institutionalDeliveryPct: pct(qInst, qB),
+      cSectionPct: pct(qCs, qB),
+      sbaAttendedPct: pct(qSba, qB),
+      lbwPct: pct(qLbw, qWeighed),
+      maternalDeaths: prevDeaths.filter(d => d.maternalDeath).length,
+      infantDeaths: prevDeaths.filter(d => d.infantDeath).length,
+    };
+
     // "Silent" ASHAs — no completed visit in 30 days. HMIS calls the facility
     // equivalent zero-reporting; it's the first thing a CMHO chases.
     const activeSet = new Set(activeEvents.map(e => String(e.ashaId)));
@@ -2364,7 +2436,15 @@ app.get('/api/admin/district', auth, requireSupervisor, async (req, res) => {
       .filter(a => a.isActive !== false && !activeSet.has(String(a._id)))
       .map(a => ({ id: String(a._id), name: a.name || '—', block: a.block || 'অজানা' }));
 
-    // Referrals that never reached a facility — the community→facility black box.
+    // Closure is measured on referrals RAISED inside the window…
+    const inWindow = referrals.filter(
+      r => r.createdAt && new Date(r.createdAt) >= since);
+    const refsRaised = inWindow.length;
+    const refsClosed =
+      inWindow.filter(r => ['reached', 'completed'].includes(r.status)).length;
+
+    // …but "still stranded" is a snapshot of NOW. A referral open for 400 days
+    // must not disappear from the alert just because the window is 3 months.
     const openReferrals = referrals.filter(r => !['reached', 'completed', 'cancelled'].includes(r.status));
     const overdueReferrals = openReferrals
       .filter(r => r.createdAt && now - new Date(r.createdAt) > 7 * 86400000)
@@ -2391,21 +2471,29 @@ app.get('/api/admin/district', auth, requireSupervisor, async (req, res) => {
           sbaAttendedPct: pct(sba, nBirths),
           lbwPct: pct(lbw, weighed),
           lbwWeighed: weighed,
-          immunizationCoveragePct: pct(vacDone, vacDone + vacOverdue),
+          // Of the doses that came DUE in this window, how many were given.
+          immunizationCoveragePct: pct(vacDone, vacDue),
+          // Snapshot of NOW — deliberately not windowed (see the loop above).
           immunizationDefaulters: vacOverdue,
           pncVisits: pncDone.length,
           maternalDeaths: maternalDeaths.length,
           infantDeaths: infantDeaths.length,
-          referralClosurePct: pct(
-            referrals.filter(r => ['reached', 'completed'].includes(r.status)).length,
-            referrals.length),
+          // Closure over referrals RAISED in the window. One raised two years
+          // ago and closed yesterday must not flatter this window.
+          referralClosurePct: pct(refsClosed, refsRaised),
           openReferrals: openReferrals.length,
         },
+        // The previous equivalent window, so the panel can answer the officer's
+        // actual question — "are we improving?" — which a snapshot cannot.
+        // Only the genuinely period-comparable indicators are here; comparing a
+        // current-state count (like defaulters) against a past window would be
+        // meaningless.
+        prev,
         blocks: [...blocks.values()].map(b => ({
           ...b,
           institutionalPct: pct(b.institutional, b.births),
           lbwPct: pct(b.lbw, b.lbwWeighed),
-          immunizationPct: pct(b.vacDone, b.vacDone + b.vacOverdue),
+          immunizationPct: pct(b.vacDone, b.vacDue),
         })).sort((x, y) => y.reports - x.reports),
         // The level directly below the caller, same indicators. This is what
         // makes the BMHO and ANM panels real: a BMHO ranks his ANMs, an ANM
@@ -2414,7 +2502,7 @@ app.get('/api/admin/district', auth, requireSupervisor, async (req, res) => {
           ...t,
           institutionalPct: pct(t.institutional, t.births),
           lbwPct: pct(t.lbw, t.lbwWeighed),
-          immunizationPct: pct(t.vacDone, t.vacDone + t.vacOverdue),
+          immunizationPct: pct(t.vacDone, t.vacDue),
         })).sort((x, y) => y.reports - x.reports),
         // The immunisation defaulters themselves, capped so a huge district
         // can't blow up the payload. `immunizationDefaulters` stays the TRUE
