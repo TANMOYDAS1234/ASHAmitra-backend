@@ -472,9 +472,72 @@ const medicineStockSchema = new mongoose.Schema({
 }, { timestamps: true });
 medicineStockSchema.index({ ashaId: 1, clientId: 1 });
 
+// ── Readiness pulse: is the life-saving kit actually THERE, right now? ───────
+//
+// Distinct from MedicineStock, which is a monthly LEDGER (opening/received/
+// issued/closing) — a register the ASHA has to keep anyway. A ledger answers
+// "what moved last month". It cannot answer "is there oxytocin in the
+// sub-centre tonight", and its medicineName is free text, so "MgSO4",
+// "Magnesium Sulphate" and "ম্যাগনেসিয়াম সালফেট" are three different strings and
+// nothing aggregates across a district.
+//
+// This is the other half of mortality. An ASHA spotting eclampsia is Delay 1.
+// Most women die in Delay 2 (reaching care) and Delay 3 (receiving it) — the
+// ambulance that didn't come, the MgSO4 that wasn't in the fridge. The two
+// biggest direct obstetric killers are haemorrhage and eclampsia, and their
+// antidotes are oxytocin and magnesium sulphate. A CMHO can fix a stockout in a
+// day, but only if she can see it.
+//
+// Hence: a fixed CODE per item (so it aggregates), a 3-state answer, and a hard
+// escalation on anything critical being OUT.
+const READINESS_ITEMS = [
+  // code, bn label, category, critical, roles that report it
+  { code: 'bp_machine',   bn: 'BP মেশিন',                  cat: 'equipment', critical: true,  roles: ['asha_worker', 'anm'] },
+  { code: 'ambulance',    bn: 'অ্যাম্বুলেন্স (102/108) পাওয়া যাচ্ছে', cat: 'transport', critical: true,  roles: ['asha_worker', 'anm'] },
+  { code: 'mgso4',        bn: 'Inj. MgSO4 (খিঁচুনি/এক্লাম্পসিয়া)', cat: 'drug',      critical: true,  roles: ['anm'] },
+  { code: 'oxytocin',     bn: 'Inj. Oxytocin (প্রসবের পর রক্তপাত)', cat: 'drug',      critical: true,  roles: ['anm'] },
+  { code: 'misoprostol',  bn: 'Tab. Misoprostol',           cat: 'drug',      critical: true,  roles: ['asha_worker', 'anm'] },
+  { code: 'delivery_kit', bn: 'ডেলিভারি কিট (DDK)',          cat: 'equipment', critical: false, roles: ['asha_worker', 'anm'] },
+  { code: 'weighing_infant', bn: 'শিশুর ওজন মাপার যন্ত্র',    cat: 'equipment', critical: false, roles: ['asha_worker', 'anm'] },
+  { code: 'thermometer',  bn: 'থার্মোমিটার',                 cat: 'equipment', critical: false, roles: ['asha_worker', 'anm'] },
+  { code: 'ifa',          bn: 'IFA (আয়রন) ট্যাবলেট',         cat: 'drug',      critical: false, roles: ['asha_worker', 'anm'] },
+  { code: 'calcium',      bn: 'ক্যালসিয়াম ট্যাবলেট',          cat: 'drug',      critical: false, roles: ['asha_worker', 'anm'] },
+  { code: 'ors_zinc',     bn: 'ORS + জিঙ্ক',                 cat: 'drug',      critical: false, roles: ['asha_worker', 'anm'] },
+  { code: 'hb_strips',    bn: 'Hb (রক্তাল্পতা) পরীক্ষার স্ট্রিপ', cat: 'equipment', critical: false, roles: ['anm'] },
+  { code: 'urine_albumin',bn: 'ইউরিন অ্যালবুমিন স্ট্রিপ',      cat: 'equipment', critical: false, roles: ['anm'] },
+  { code: 'td_vaccine',   bn: 'Td টিকা',                     cat: 'drug',      critical: false, roles: ['anm'] },
+  { code: 'chlorhexidine',bn: 'ক্লোরহেক্সিডিন (নাড়ির যত্ন)',   cat: 'drug',      critical: false, roles: ['anm'] },
+  // Facility readiness — Delay 3. Only a block officer can answer these.
+  { code: 'blood_fru',    bn: 'FRU-তে রক্ত পাওয়া যাচ্ছে',     cat: 'facility',  critical: true,  roles: ['bmho'] },
+  { code: 'csection_night', bn: 'রাতে সিজার করা সম্ভব',        cat: 'facility',  critical: true,  roles: ['bmho'] },
+];
+const READINESS_BY_CODE = Object.fromEntries(READINESS_ITEMS.map(i => [i.code, i]));
+
+// A pulse, not a ledger: only the LATEST report per person counts. And a report
+// older than STALE_DAYS is treated as UNKNOWN, never as "fine" — silence must
+// never read as good news. (Same trap as showing 0% when the denominator is 0.)
+const READINESS_STALE_DAYS = 10;
+
+const readinessSchema = new mongoose.Schema({
+  reporterId: { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true, index: true },
+  role:       { type: String, default: '' },
+  // Snapshotted so a later transfer doesn't silently rewrite where a historic
+  // stockout happened.
+  block:      { type: String, default: '' },
+  subCentre:  { type: String, default: '' },
+  items: [{
+    _id:    false,
+    code:   { type: String, required: true },
+    status: { type: String, enum: ['ok', 'low', 'out'], required: true },
+    note:   { type: String, default: '' },
+  }],
+}, { timestamps: true });
+readinessSchema.index({ reporterId: 1, createdAt: -1 });
+
 const User          = mongoose.model('User',          userSchema);
 const Patient       = mongoose.model('Patient',       patientSchema);
 const Report        = mongoose.model('Report',        reportSchema);
+const Readiness     = mongoose.model('Readiness',     readinessSchema);
 const Notification  = mongoose.model('Notification',  notificationSchema);
 const AiCache       = mongoose.model('AiCache',       aiCacheSchema);
 const ScheduleEvent = mongoose.model('ScheduleEvent', scheduleEventSchema);
@@ -1981,6 +2044,199 @@ app.post('/api/reports', auth, async (req, res) => {
       });
     }
     res.status(201).json({ success: true, data: toClient(report) });
+  } catch (err) {
+    res.status(500).json({ success: false, message: err.message });
+  }
+});
+
+// ── Readiness pulse (supply / equipment / transport) ──────────────────────────
+
+// The items THIS user is asked about. Role-scoped so an ASHA gets an 8-item,
+// 30-second form and is never asked about the sub-centre fridge she doesn't own.
+app.get('/api/readiness/catalogue', auth, async (req, res) => {
+  try {
+    const me = await User.findById(req.user.id).select('role isAdmin').lean();
+    const role = effectiveRole(me || {});
+    const items = READINESS_ITEMS
+      .filter(i => i.roles.includes(role))
+      .map(({ code, bn, cat, critical }) => ({ code, bn, cat, critical }));
+    const last = await Readiness.findOne({ reporterId: req.user.id })
+      .sort({ createdAt: -1 }).lean();
+    res.json({
+      success: true,
+      role,
+      items,
+      staleDays: READINESS_STALE_DAYS,
+      last: last ? { at: last.createdAt, items: last.items } : null,
+    });
+  } catch (err) {
+    res.status(500).json({ success: false, message: err.message });
+  }
+});
+
+// Submit a check. Anything CRITICAL marked 'out' escalates immediately up the
+// chain — that is the entire point. A missing MgSO4 that only shows up in next
+// month's report is a woman who dies this month.
+app.post('/api/readiness/report', auth, async (req, res) => {
+  try {
+    const me = await User.findById(req.user.id).select('name role isAdmin block subCentre').lean();
+    if (!me) return res.status(404).json({ success: false, message: 'User not found' });
+    const role = effectiveRole(me);
+
+    const allowed = new Set(READINESS_ITEMS.filter(i => i.roles.includes(role)).map(i => i.code));
+    const items = (Array.isArray(req.body.items) ? req.body.items : [])
+      .filter(i => i && allowed.has(i.code) && ['ok', 'low', 'out'].includes(i.status))
+      .map(i => ({ code: i.code, status: i.status, note: String(i.note || '').slice(0, 200) }));
+    if (!items.length) {
+      return res.status(400).json({ success: false, message: 'No valid items' });
+    }
+
+    const doc = await Readiness.create({
+      reporterId: me._id,
+      role,
+      block: me.block || '',
+      subCentre: me.subCentre || '',
+      items,
+    });
+
+    const criticalOut = items.filter(
+      i => i.status === 'out' && READINESS_BY_CODE[i.code] && READINESS_BY_CODE[i.code].critical);
+
+    if (criticalOut.length) {
+      const names = criticalOut.map(i => READINESS_BY_CODE[i.code].bn).join(', ');
+      const where = [me.subCentre, me.block].filter(Boolean).join(', ') || 'অজানা';
+      notifySupervisors(me._id, {
+        type: 'readiness',
+        title: `জরুরি: ${names} নেই`,
+        body: `${me.name || 'একজন কর্মী'} — ${where}. এখনই ব্যবস্থা নিন।`,
+        link: '/readiness/summary',
+        data: { codes: criticalOut.map(i => i.code), block: me.block || '' },
+      });
+    }
+
+    res.status(201).json({
+      success: true,
+      id: String(doc._id),
+      escalated: criticalOut.length,
+    });
+  } catch (err) {
+    res.status(500).json({ success: false, message: err.message });
+  }
+});
+
+// Supervisor view, scoped to my subtree and rolled up district -> block -> unit.
+//
+// Two deliberate choices:
+//  • A report older than READINESS_STALE_DAYS is UNKNOWN, not OK. Silence is not
+//    good news — a sub-centre that never reports is exactly as dangerous as one
+//    reporting a stockout, and far easier to overlook.
+//  • Nobody is counted "fine" by omission: `never` and `stale` are first-class
+//    numbers, surfaced next to the stockouts.
+app.get('/api/readiness/summary', auth, requireSupervisor, async (req, res) => {
+  try {
+    const ids = await subtreeUserIds(req.user.id);          // everyone under me
+    const people = await User.find({ _id: { $in: ids }, isActive: { $ne: false } })
+      .select('name role isAdmin block subCentre').lean();
+    if (!people.length) {
+      return res.json({ success: true, data: { coverage: {}, critical: [], low: [], blocks: [] } });
+    }
+
+    // Latest report per person — a pulse, so history is irrelevant here.
+    const latest = await Readiness.aggregate([
+      { $match: { reporterId: { $in: people.map(p => p._id) } } },
+      { $sort: { createdAt: -1 } },
+      { $group: { _id: '$reporterId', doc: { $first: '$$ROOT' } } },
+    ]);
+    const byPerson = new Map(latest.map(r => [String(r._id), r.doc]));
+
+    const now = Date.now();
+    const staleMs = READINESS_STALE_DAYS * 86400000;
+    const critical = new Map();   // code -> places[]
+    const low = new Map();        // code -> count
+    const blocks = new Map();     // block -> rollup
+
+    let reported = 0, stale = 0, never = 0;
+
+    for (const p of people) {
+      const role = effectiveRole(p);
+      // Only count people we actually ASK. A BMHO isn't delinquent for not
+      // reporting items that were never on her form.
+      const asked = READINESS_ITEMS.some(i => i.roles.includes(role));
+      if (!asked) continue;
+
+      const blockKey = p.block || 'অজানা';
+      if (!blocks.has(blockKey)) {
+        blocks.set(blockKey, {
+          block: blockKey, criticalOut: 0, low: 0,
+          reported: 0, stale: 0, never: 0, units: [],
+        });
+      }
+      const B = blocks.get(blockKey);
+
+      const doc = byPerson.get(String(p._id));
+      const ageMs = doc ? now - new Date(doc.createdAt).getTime() : null;
+      const isStale = doc ? ageMs > staleMs : false;
+
+      const unit = {
+        id: String(p._id),
+        name: p.name || '—',
+        role,
+        block: blockKey,
+        subCentre: p.subCentre || '',
+        lastReport: doc ? doc.createdAt : null,
+        daysAgo: doc ? Math.floor(ageMs / 86400000) : null,
+        state: !doc ? 'never' : (isStale ? 'stale' : 'fresh'),
+        criticalOut: [],
+        low: [],
+      };
+
+      if (!doc)      { never++;    B.never++; }
+      else if (isStale) { stale++; B.stale++; }
+      else {
+        reported++; B.reported++;
+        for (const it of (doc.items || [])) {
+          const meta = READINESS_BY_CODE[it.code];
+          if (!meta) continue;
+          if (it.status === 'out' && meta.critical) {
+            unit.criticalOut.push(it.code);
+            B.criticalOut++;
+            if (!critical.has(it.code)) critical.set(it.code, []);
+            critical.get(it.code).push({
+              name: unit.name, role, block: blockKey,
+              subCentre: unit.subCentre, daysAgo: unit.daysAgo, note: it.note || '',
+            });
+          } else if (it.status === 'out' || it.status === 'low') {
+            unit.low.push(it.code);
+            B.low++;
+            low.set(it.code, (low.get(it.code) || 0) + 1);
+          }
+        }
+      }
+      B.units.push(unit);
+    }
+
+    const label = (c) => (READINESS_BY_CODE[c] ? READINESS_BY_CODE[c].bn : c);
+
+    res.json({
+      success: true,
+      data: {
+        staleDays: READINESS_STALE_DAYS,
+        coverage: {
+          expected: reported + stale + never,
+          reported, stale, never,
+        },
+        // Worst first — a CMHO reads the top of the list and nothing else.
+        critical: [...critical.entries()]
+          .map(([code, places]) => ({ code, bn: label(code), count: places.length, places }))
+          .sort((a, b) => b.count - a.count),
+        low: [...low.entries()]
+          .map(([code, count]) => ({ code, bn: label(code), count }))
+          .sort((a, b) => b.count - a.count),
+        blocks: [...blocks.values()]
+          .map(b => ({ ...b, units: b.units.sort((x, y) => y.criticalOut.length - x.criticalOut.length) }))
+          .sort((a, b) => b.criticalOut - a.criticalOut),
+      },
+    });
   } catch (err) {
     res.status(500).json({ success: false, message: err.message });
   }
