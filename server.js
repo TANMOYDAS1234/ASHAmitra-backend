@@ -863,7 +863,7 @@ app.get('/health', (_, res) => {
     success: true,
     message: 'AshaMitra backend is running',
     version: '1.0.0',
-    build: 'gemini-primary+lang-normalize+mch-schedule+reminders+ocr+remindlog+hbyc+aadhaarqr2+patientversionfix+agegenderfix+editlegacyversionfix+dobschedguard+identitydedup+referrals+pncschedule+watemplate+eligiblecouples+vitalevents+ecaadhaar+ancplan+ancwindow+reminderhealth+msg91sms+ncdcbac+tbcases+medstock+ancwb+missweekly+adminmodstats+hierarchy-roles+district-hmis+teamrollup-2026-07',
+    build: 'gemini-primary+lang-normalize+mch-schedule+reminders+ocr+remindlog+hbyc+aadhaarqr2+patientversionfix+agegenderfix+editlegacyversionfix+dobschedguard+identitydedup+referrals+pncschedule+watemplate+eligiblecouples+vitalevents+ecaadhaar+ancplan+ancwindow+reminderhealth+msg91sms+ncdcbac+tbcases+medstock+ancwb+missweekly+adminmodstats+hierarchy-roles+district-hmis+teamrollup+defaulters-2026-07',
     ocr: !!tesseract,
     qr: !!(Jimp && jsQR), // Aadhaar QR engine loaded? (false ⇒ npm i jimp jsqr on VPS)
     chatPrimary: 'gemini', // resolveChatReply tries Gemini first, Groq fallback
@@ -2188,7 +2188,10 @@ app.get('/api/admin/district', auth, requireSupervisor, async (req, res) => {
         Patient.find({ ...A, type: { $regex: /^pregnan/i } })
           .select('_id ashaId lmp createdAt mcpDetails').lean(),
         ScheduleEvent.find({ ...A, kind: 'anc', status: 'done' }).select('patientId ashaId').lean(),
-        ScheduleEvent.find({ ...A, kind: 'vaccine' }).select('ashaId status windowEnd dueDate').lean(),
+        // Carry the patient identity too: an officer cannot act on the number
+        // "13" — they need to know WHO is overdue, for what, and whose ASHA.
+        ScheduleEvent.find({ ...A, kind: 'vaccine' })
+          .select('ashaId status windowEnd dueDate label patientId patientName patientMobile').lean(),
         ScheduleEvent.find({ ...A, kind: { $in: ['hbnc', 'pnc'] }, status: 'done' }).select('ashaId').lean(),
         Referral.find({ ...A }).select('ashaId status band createdAt patientName village').lean(),
         MedicineStock.find({
@@ -2285,6 +2288,7 @@ app.get('/api/admin/district', auth, requireSupervisor, async (req, res) => {
 
     // Immunization → coverage and defaulters (pending past the clinical window).
     let vacDone = 0, vacOverdue = 0;
+    const defaulterRows = []; // the actual children, not just the count
     for (const e of vac) {
       if (e.status === 'done') {
         vacDone++;
@@ -2294,9 +2298,21 @@ app.get('/api/admin/district', auth, requireSupervisor, async (req, res) => {
         if (end && new Date(end) < now) {
           vacOverdue++;
           both(e.ashaId, r => r.vacOverdue++);
+          defaulterRows.push({
+            id: String(e._id),
+            patientId: e.patientId ? String(e.patientId) : '',
+            patientName: e.patientName || '—',
+            patientMobile: e.patientMobile || '',
+            label: e.label || '',
+            daysOverdue: Math.floor((now - new Date(end)) / 86400000),
+            asha: nameOf.get(String(e.ashaId)) || '—',
+            block: blockOf.get(String(e.ashaId)) || 'অজানা',
+          });
         }
       }
     }
+    // Longest-overdue first — that's the order an officer works the list in.
+    defaulterRows.sort((a, b) => b.daysOverdue - a.daysOverdue);
 
     for (const rep of reports) {
       both(rep.ashaId, r => r.reports++);
@@ -2364,6 +2380,12 @@ app.get('/api/admin/district', auth, requireSupervisor, async (req, res) => {
           lbwPct: pct(t.lbw, t.lbwWeighed),
           immunizationPct: pct(t.vacDone, t.vacDone + t.vacOverdue),
         })).sort((x, y) => y.reports - x.reports),
+        // The immunisation defaulters themselves, capped so a huge district
+        // can't blow up the payload. `immunizationDefaulters` stays the TRUE
+        // total, so the UI can say "showing 100 of 240" rather than silently
+        // truncating and looking like the problem is smaller than it is.
+        defaulters: defaulterRows.slice(0, 100),
+        defaultersTotal: defaulterRows.length,
         alerts: {
           maternalDeaths: maternalDeaths.map(d => ({
             name: d.personName || '—', village: d.village || '', date: d.eventDate,
