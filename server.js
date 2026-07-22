@@ -3007,7 +3007,11 @@ app.get('/api/admin/district', auth, requireSupervisor, async (req, res) => {
         Report.find({
           ...A, createdAt: { $gte: since },
           $or: [{ deletedAt: null }, { deletedAt: { $exists: false } }],
-        }).select('ashaId finalBand').lean(),
+        // createdAt is needed for the monthly series — without it every report
+        // buckets to null and the trend line reads flat zero while the totals
+        // say 36. A chart that disagrees with the number beside it destroys
+        // trust in both.
+        }).select('ashaId finalBand createdAt').lean(),
       ]);
 
     const pct = (n, d) => (d > 0 ? Math.round((n / d) * 1000) / 10 : null);
@@ -3236,10 +3240,73 @@ app.get('/api/admin/district', auth, requireSupervisor, async (req, res) => {
       }))
       .sort((a, b) => b.days - a.days);
 
+    // ── Real monthly series ───────────────────────────────────────────────────
+    //
+    // Until now the panel had exactly TWO points per indicator — this window and
+    // the one before it — so any "trend" line drawn from it was decoration
+    // pretending to be data. Everything below is bucketed from rows already in
+    // memory, so this costs no extra queries.
+    //
+    // A CMHO reads direction, not level: "immunization has fallen three months
+    // running" is a decision; "immunization is 58%" is a number.
+    const monthKeys = [];
+    {
+      const d = new Date(since.getFullYear(), since.getMonth(), 1);
+      const last = new Date(now.getFullYear(), now.getMonth(), 1);
+      while (d <= last) {
+        monthKeys.push(`${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}`);
+        d.setMonth(d.getMonth() + 1);
+      }
+    }
+    const mk = (dt) => {
+      if (!dt) return null;
+      const d = new Date(dt);
+      return Number.isNaN(d.getTime())
+        ? null
+        : `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}`;
+    };
+    const bucket = (rows, dateOf, hit = () => true) => {
+      const m = Object.fromEntries(monthKeys.map(k => [k, 0]));
+      for (const r of rows) {
+        const k = mk(dateOf(r));
+        if (k !== null && k in m && hit(r)) m[k]++;
+      }
+      return monthKeys.map(k => m[k]);
+    };
+
+    const vaccineDone = vac.filter(e => e.status === 'done');
+    const trend = {
+      months: monthKeys,
+      births:        bucket(births, r => r.eventDate),
+      pregnancies:   bucket(pregNow, r => r.createdAt),
+      immunization:  bucket(vaccineDone, r => r.doneDate || r.dueDate),
+      reports:       bucket(reports, r => r.createdAt),
+      redReports:    bucket(reports, r => r.createdAt, r => r.finalBand === 'RED'),
+      referrals:     bucket(inWindow, r => r.createdAt),
+      maternalDeaths: bucket(deaths, r => r.eventDate, r => r.maternalDeath === true),
+      infantDeaths:   bucket(deaths, r => r.eventDate, r => r.infantDeath === true),
+    };
+
     res.json({
       success: true,
       data: {
         periodMonths: months,
+        trend,
+        // Reference levels for the indicators that have a recognised one, so a
+        // number becomes a GAP — "18 points below reference" is an instruction,
+        // "58.1%" is trivia. `dir` says which way is good; cSection is a RANGE
+        // because both too few and too many caesareans signal a failing system,
+        // which is precisely why this screen never puts an arrow on it.
+        benchmarks: {
+          institutionalDeliveryPct: { target: 95, dir: 'up' },
+          ancFirstTrimesterPct:     { target: 90, dir: 'up' },
+          anc4PlusPct:              { target: 70, dir: 'up' },
+          immunizationCoveragePct:  { target: 90, dir: 'up' },
+          sbaAttendedPct:           { target: 95, dir: 'up' },
+          lbwPct:                   { target: 10, dir: 'down' },
+          referralClosurePct:       { target: 90, dir: 'up' },
+          cSectionPct:              { min: 10, max: 15, dir: 'range' },
+        },
         indicators: {
           ashas: ashaDocs.length,
           // pregNow, NOT pregnancies — the query deliberately spans this window
