@@ -338,7 +338,11 @@ const vitalEventSchema = new mongoose.Schema({
   ashaId:        { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true, index: true },
   clientId:      { type: String, default: '' },
   patientId:     { type: String, default: '' },     // optional link to a Patient
-  eventType:     { type: String, default: 'birth', index: true }, // birth|death
+  // birth | death | stillbirth. Stillbirth is a distinct legal and clinical
+  // event — it is neither a live birth nor an infant death — and the stillbirth
+  // rate (SBR) is a core maternal-health indicator the district reports upward.
+  // Without this value it was simply uncountable.
+  eventType:     { type: String, default: 'birth', index: true },
   // Common
   personName:    { type: String, default: '' },     // newborn / deceased (may be blank for a birth)
   sex:           { type: String, default: '' },      // Male|Female|Other
@@ -534,10 +538,227 @@ const readinessSchema = new mongoose.Schema({
 }, { timestamps: true });
 readinessSchema.index({ reporterId: 1, createdAt: -1 });
 
+// ── District assets ──────────────────────────────────────────────────────────
+//
+// Everything above this line is owned by an ASHA (`ashaId`) — it is field data.
+// Everything below is owned by the DISTRICT and maintained by supervisors. That
+// distinction is the whole reason these are separate schemas rather than more
+// columns on existing ones: a facility is not a patient, and a budget line has
+// no ASHA.
+//
+// Scoped by `district` + `block` so the existing subtree logic still applies:
+// a CMHO sees her district, a BMHO sees his block.
+
+// Area 1 + 13: the facility model. Its absence was the single biggest structural
+// gap — facility administration, inspection and facility-level logistics all
+// depend on there being a thing called a facility.
+const facilitySchema = new mongoose.Schema({
+  district:   { type: String, default: '', index: true },
+  block:      { type: String, default: '', index: true },
+  name:       { type: String, required: true },
+  // DH | SDH | SGH | BPHC | PHC | HWC | SC
+  type:       { type: String, default: 'PHC', index: true },
+  village:    { type: String, default: '' },
+  incharge:   { type: String, default: '' },
+  mobile:     { type: String, default: '' },
+  // Sanctioned vs in-post, per cadre. The GAP is the number a CMHO acts on —
+  // "3 of 5 ANM posts vacant at Kalyani BPHC" is a posting decision.
+  staff: [{
+    _id: false,
+    cadre:      { type: String, default: '' }, // MO | Specialist | StaffNurse | GNM | ANM | Pharmacist | LabTech | MPW | DataManager
+    sanctioned: { type: Number, default: 0 },
+    inPost:     { type: Number, default: 0 },
+  }],
+  // Service availability — what this facility can actually DO tonight.
+  services: {
+    ot:            { type: Boolean, default: false },
+    labourRoom:    { type: Boolean, default: false },
+    lab:           { type: Boolean, default: false },
+    bloodStorage:  { type: Boolean, default: false },
+    ambulance:     { type: Boolean, default: false },
+    oxygen:        { type: Boolean, default: false },
+    xray:          { type: Boolean, default: false },
+    ultrasound:    { type: Boolean, default: false },
+    ilr:           { type: Boolean, default: false }, // cold chain point
+    deliveries24x7:{ type: Boolean, default: false },
+  },
+  isActive:   { type: Boolean, default: true },
+  notes:      { type: String, default: '' },
+}, { timestamps: true });
+facilitySchema.index({ district: 1, block: 1, type: 1 });
+
+// Area 6 + 7: syndromic surveillance. The triage engine has seven case types and
+// all of them are RCH, so the app has been blind to the commonest reason a
+// villager seeks care. Counting cases is not the point — DETECTING A CLUSTER is.
+const surveillanceSchema = new mongoose.Schema({
+  ashaId:     { type: mongoose.Schema.Types.ObjectId, ref: 'User', index: true },
+  clientId:   { type: String, default: '' },
+  // fever | diarrhoea | ari | rash | jaundice | other
+  syndrome:   { type: String, default: 'fever', index: true },
+  personName: { type: String, default: '' },
+  age:        { type: String, default: '' },
+  sex:        { type: String, default: '' },
+  village:    { type: String, default: '', index: true },
+  block:      { type: String, default: '', index: true },
+  mobile:     { type: String, default: '' },
+  onsetDate:  { type: Date, default: Date.now, index: true },
+  durationDays:{ type: Number, default: 0 },
+  dangerSigns:[{ type: String }],
+  // Field tests an ASHA can actually do or arrange.
+  rdtMalaria: { type: String, default: '' },  // '' | positive | negative
+  bloodSmear: { type: Boolean, default: false },
+  dengueSuspect: { type: Boolean, default: false },
+  referred:   { type: Boolean, default: false },
+  outcome:    { type: String, default: '' },  // recovered | referred | died
+  notes:      { type: String, default: '' },
+  version:    { type: Number, default: 0 },
+}, { timestamps: true });
+surveillanceSchema.index({ village: 1, syndrome: 1, onsetDate: -1 });
+
+// Area 12: outbreak / disaster response, opened by a supervisor when a cluster is
+// confirmed. This is the RRT record the role definition describes.
+const outbreakSchema = new mongoose.Schema({
+  district:   { type: String, default: '', index: true },
+  block:      { type: String, default: '' },
+  village:    { type: String, default: '' },
+  // outbreak | flood | cyclone | epidemic | other
+  kind:       { type: String, default: 'outbreak' },
+  syndrome:   { type: String, default: '' },
+  title:      { type: String, required: true },
+  detectedAt: { type: Date, default: Date.now },
+  caseCount:  { type: Number, default: 0 },
+  deaths:     { type: Number, default: 0 },
+  status:     { type: String, default: 'open', index: true }, // open | contained | closed
+  // The standard public-health response checklist. Ticked as each is arranged,
+  // so a CMHO can see at a glance what has NOT been done yet.
+  actions: {
+    rrtDeployed:      { type: Boolean, default: false },
+    waterTested:      { type: Boolean, default: false },
+    foodSampled:      { type: Boolean, default: false },
+    chlorination:     { type: Boolean, default: false },
+    orsCamp:          { type: Boolean, default: false },
+    medicalCamp:      { type: Boolean, default: false },
+    ambulanceOnSite:  { type: Boolean, default: false },
+    awarenessDrive:   { type: Boolean, default: false },
+    vectorControl:    { type: Boolean, default: false },
+  },
+  leadOfficer:{ type: String, default: '' },
+  notes:      { type: String, default: '' },
+  closedAt:   { type: Date, default: null },
+}, { timestamps: true });
+
+// Area 4: cold chain. A failed ILR silently destroys a whole block's vaccine
+// stock and nothing in the system would say so. Twice-daily temperature is the
+// national protocol; out-of-range is 2-8 C for an ILR.
+const coldChainSchema = new mongoose.Schema({
+  facilityId: { type: mongoose.Schema.Types.ObjectId, ref: 'Facility', index: true },
+  facilityName:{ type: String, default: '' },
+  district:   { type: String, default: '', index: true },
+  block:      { type: String, default: '', index: true },
+  reportedBy: { type: mongoose.Schema.Types.ObjectId, ref: 'User' },
+  date:       { type: Date, default: Date.now, index: true },
+  equipment:  { type: String, default: 'ILR' }, // ILR | DeepFreezer
+  tempAm:     { type: Number, default: null },
+  tempPm:     { type: Number, default: null },
+  powerCutHours: { type: Number, default: 0 },
+  working:    { type: Boolean, default: true },
+  vaccineMoved: { type: Boolean, default: false }, // stock shifted after a failure
+  notes:      { type: String, default: '' },
+}, { timestamps: true });
+
+// Area 13: facility inspection / quality assurance.
+const inspectionSchema = new mongoose.Schema({
+  facilityId: { type: mongoose.Schema.Types.ObjectId, ref: 'Facility', index: true },
+  facilityName:{ type: String, default: '' },
+  district:   { type: String, default: '', index: true },
+  block:      { type: String, default: '' },
+  inspectorId:{ type: mongoose.Schema.Types.ObjectId, ref: 'User' },
+  inspectorName:{ type: String, default: '' },
+  date:       { type: Date, default: Date.now, index: true },
+  // Each item: ok | issue | critical. Stored as a list so the checklist can grow
+  // without a migration.
+  items: [{
+    _id: false,
+    code:   { type: String, default: '' },
+    status: { type: String, default: 'ok' },
+    note:   { type: String, default: '' },
+  }],
+  score:      { type: Number, default: null },   // % of items OK
+  followUpDate:{ type: Date, default: null },
+  notes:      { type: String, default: '' },
+}, { timestamps: true });
+
+// Area 11: training and capacity building.
+const trainingSchema = new mongoose.Schema({
+  district:   { type: String, default: '', index: true },
+  block:      { type: String, default: '' },
+  title:      { type: String, required: true },
+  topic:      { type: String, default: '' },
+  date:       { type: Date, default: Date.now, index: true },
+  venue:      { type: String, default: '' },
+  trainer:    { type: String, default: '' },
+  targetCadre:{ type: String, default: '' },
+  invited:    { type: Number, default: 0 },
+  // Attendance captured AT the event, by user id where possible — a training
+  // register that is filled in afterwards from memory is worth very little.
+  attendees:  [{ type: mongoose.Schema.Types.ObjectId, ref: 'User' }],
+  attendedCount: { type: Number, default: 0 },
+  notes:      { type: String, default: '' },
+}, { timestamps: true });
+
+// Area 14: review meetings.
+const meetingSchema = new mongoose.Schema({
+  district:   { type: String, default: '', index: true },
+  block:      { type: String, default: '' },
+  // districtHealthSociety | programmeReview | epidemic | immunization | fp | tb | ncd | other
+  kind:       { type: String, default: 'programmeReview', index: true },
+  title:      { type: String, required: true },
+  date:       { type: Date, default: Date.now, index: true },
+  venue:      { type: String, default: '' },
+  chair:      { type: String, default: '' },
+  attendees:  { type: Number, default: 0 },
+  agenda:     { type: String, default: '' },
+  decisions:  { type: String, default: '' },
+  // Decisions are worthless without an owner and a date. Open items become the
+  // follow-up list on the meetings screen.
+  actionItems: [{
+    _id: false,
+    what:   { type: String, default: '' },
+    who:    { type: String, default: '' },
+    byDate: { type: Date, default: null },
+    done:   { type: Boolean, default: false },
+  }],
+  notes:      { type: String, default: '' },
+}, { timestamps: true });
+
+// Area 8: budget. Deliberately VISIBILITY ONLY — allocation vs expenditure per
+// head. This is not a treasury system and must never be mistaken for one: there
+// is no approval workflow, no audit trail and no payment. It exists so a CMHO can
+// see utilisation against allocation, which is the question asked in review.
+const budgetSchema = new mongoose.Schema({
+  district:   { type: String, default: '', index: true },
+  block:      { type: String, default: '' },
+  financialYear:{ type: String, default: '', index: true }, // '2026-27'
+  head:       { type: String, required: true },  // e.g. 'RCH Flexipool'
+  scheme:     { type: String, default: '' },
+  allocated:  { type: Number, default: 0 },
+  spent:      { type: Number, default: 0 },
+  committed:  { type: Number, default: 0 },
+  notes:      { type: String, default: '' },
+}, { timestamps: true });
+
 const User          = mongoose.model('User',          userSchema);
 const Patient       = mongoose.model('Patient',       patientSchema);
 const Report        = mongoose.model('Report',        reportSchema);
 const Readiness     = mongoose.model('Readiness',     readinessSchema);
+const Facility      = mongoose.model('Facility',      facilitySchema);
+const Surveillance  = mongoose.model('Surveillance',  surveillanceSchema);
+const Outbreak      = mongoose.model('Outbreak',      outbreakSchema);
+const ColdChain     = mongoose.model('ColdChain',     coldChainSchema);
+const Inspection    = mongoose.model('Inspection',    inspectionSchema);
+const Training      = mongoose.model('Training',      trainingSchema);
+const Meeting       = mongoose.model('Meeting',       meetingSchema);
+const Budget        = mongoose.model('Budget',        budgetSchema);
 const Notification  = mongoose.model('Notification',  notificationSchema);
 const AiCache       = mongoose.model('AiCache',       aiCacheSchema);
 const ScheduleEvent = mongoose.model('ScheduleEvent', scheduleEventSchema);
@@ -2044,6 +2265,378 @@ app.post('/api/reports', auth, async (req, res) => {
       });
     }
     res.status(201).json({ success: true, data: toClient(report) });
+  } catch (err) {
+    res.status(500).json({ success: false, message: err.message });
+  }
+});
+
+// ── District operations: facilities, surveillance, cold chain, QA, meetings ──
+//
+// A district-scoped counterpart to registerSyncedCrud. That helper scopes every
+// row to `ashaId` because field data belongs to the worker who collected it.
+// These assets belong to the DISTRICT, so they scope by district + block and are
+// writable only by supervisors — an ASHA must not be able to edit a budget line
+// or close an outbreak.
+//
+// A BMHO sees and edits his own block; a CMHO sees the whole district. That
+// mirrors the subtree rule used everywhere else rather than inventing a second
+// permission model.
+function registerDistrictCrud(path, Model, { blockScoped = true } = {}) {
+  const scopeOf = async (userId) => {
+    const u = await User.findById(userId).select('role isAdmin district block').lean();
+    if (!u) return null;
+    const role = effectiveRole(u);
+    const q = {};
+    if (u.district) q.district = u.district;
+    // Only a CMHO sees across blocks. Anyone lower is pinned to their own.
+    if (blockScoped && role !== 'cmho' && u.block) q.block = u.block;
+    return { user: u, role, q };
+  };
+
+  app.get(`/api/${path}`, auth, requireSupervisor, async (req, res) => {
+    try {
+      const s = await scopeOf(req.user.id);
+      if (!s) return res.status(404).json({ success: false, message: 'User not found' });
+      const docs = await Model.find(s.q).sort({ createdAt: -1 }).limit(1000);
+      res.json({ success: true, data: docs.map(toClient) });
+    } catch (err) {
+      res.status(500).json({ success: false, message: err.message });
+    }
+  });
+
+  app.post(`/api/${path}`, auth, requireSupervisor, async (req, res) => {
+    try {
+      const s = await scopeOf(req.user.id);
+      if (!s) return res.status(404).json({ success: false, message: 'User not found' });
+      const body = { ...req.body };
+      delete body._id; delete body.id;
+      // District and block are stamped from the creator, never trusted from the
+      // client — otherwise a BMHO could file a record against another block.
+      body.district = s.user.district || '';
+      if (blockScoped && s.role !== 'cmho') body.block = s.user.block || '';
+      const doc = await Model.create(body);
+      res.status(201).json({ success: true, data: toClient(doc) });
+    } catch (err) {
+      res.status(500).json({ success: false, message: err.message });
+    }
+  });
+
+  app.put(`/api/${path}/:id`, auth, requireSupervisor, async (req, res) => {
+    try {
+      const s = await scopeOf(req.user.id);
+      if (!s) return res.status(404).json({ success: false, message: 'User not found' });
+      const updates = { ...req.body };
+      delete updates._id; delete updates.id; delete updates.district;
+      const doc = await Model.findOneAndUpdate(
+        { _id: req.params.id, ...s.q }, { $set: updates }, { new: true });
+      if (!doc) return res.status(404).json({ success: false, message: 'Not found' });
+      res.json({ success: true, data: toClient(doc) });
+    } catch (err) {
+      res.status(500).json({ success: false, message: err.message });
+    }
+  });
+
+  app.delete(`/api/${path}/:id`, auth, requireSupervisor, async (req, res) => {
+    try {
+      const s = await scopeOf(req.user.id);
+      if (!s) return res.status(404).json({ success: false, message: 'User not found' });
+      const doc = await Model.findOneAndDelete({ _id: req.params.id, ...s.q });
+      if (!doc) return res.status(404).json({ success: false, message: 'Not found' });
+      res.json({ success: true });
+    } catch (err) {
+      res.status(500).json({ success: false, message: err.message });
+    }
+  });
+}
+
+registerDistrictCrud('facilities',  Facility);
+registerDistrictCrud('outbreaks',   Outbreak);
+registerDistrictCrud('cold-chain',  ColdChain);
+registerDistrictCrud('inspections', Inspection);
+registerDistrictCrud('trainings',   Training);
+registerDistrictCrud('meetings',    Meeting);
+registerDistrictCrud('budget',      Budget, { blockScoped: false }); // district head only
+
+// Surveillance is FIELD data — an ASHA records it — so it uses the worker-scoped
+// helper like every other module she fills in.
+registerSyncedCrud('surveillance', Surveillance);
+
+// ── Surveillance: cluster detection ──────────────────────────────────────────
+//
+// Counting fever cases is not surveillance. DETECTING AN UNUSUAL RISE is. This
+// compares each village's last 7 days against its own preceding 3-week average,
+// which is the standard approach: a village that always reports 8 fevers a week
+// is normal, and a village that usually reports 1 and now reports 5 is not.
+//
+// Comparing villages to each other would flag the biggest village every week.
+app.get('/api/admin/surveillance', auth, requireSupervisor, async (req, res) => {
+  try {
+    const ashaIds = await subtreeAshaIds(req.user);
+    if (!ashaIds.length) {
+      return res.json({ success: true, data: { clusters: [], recent: [], bySyndrome: [], totals: {} } });
+    }
+    const now = Date.now();
+    const d7  = new Date(now - 7 * 86400000);
+    const d28 = new Date(now - 28 * 86400000);
+
+    const rows = await Surveillance.find({
+      ashaId: { $in: ashaIds }, onsetDate: { $gte: d28 },
+    }).select('syndrome personName village block onsetDate dangerSigns rdtMalaria dengueSuspect referred mobile ashaId').lean();
+
+    const ashaDocs = await User.find({ _id: { $in: ashaIds } }).select('_id name block').lean();
+    const blockOf = new Map(ashaDocs.map(a => [String(a._id), a.block || 'অজানা']));
+
+    const recent = rows.filter(r => new Date(r.onsetDate) >= d7);
+
+    // village|syndrome -> { last7, prev21 }
+    const cell = new Map();
+    for (const r of rows) {
+      const v = r.village || 'অজানা';
+      const k = `${v}|${r.syndrome}`;
+      if (!cell.has(k)) {
+        cell.set(k, { village: v, syndrome: r.syndrome, block: r.block || blockOf.get(String(r.ashaId)) || 'অজানা', last7: 0, prev21: 0, people: [] });
+      }
+      const e = cell.get(k);
+      if (new Date(r.onsetDate) >= d7) { e.last7++; e.people.push(r); }
+      else e.prev21++;
+    }
+
+    const clusters = [];
+    for (const e of cell.values()) {
+      const baseline = e.prev21 / 3; // per-week average over the preceding 3 weeks
+      // Two ways to qualify. The second matters because a village with NO history
+      // that suddenly reports five cases is the classic point-source outbreak —
+      // and a purely ratio-based rule divides by zero and misses it entirely.
+      const spike = baseline >= 1 && e.last7 >= baseline * 2 && e.last7 >= 3;
+      const novel = baseline < 1 && e.last7 >= 4;
+      if (!spike && !novel) continue;
+      clusters.push({
+        village: e.village, block: e.block, syndrome: e.syndrome,
+        last7: e.last7,
+        baseline: Math.round(baseline * 10) / 10,
+        multiple: baseline > 0 ? Math.round((e.last7 / baseline) * 10) / 10 : null,
+        reason: spike ? 'spike' : 'novel',
+        malariaPositive: e.people.filter(p => p.rdtMalaria === 'positive').length,
+        dengueSuspect: e.people.filter(p => p.dengueSuspect === true).length,
+        people: e.people.slice(0, 20).map(p => ({
+          name: p.personName || '—', village: p.village || '',
+          onset: p.onsetDate, mobile: p.mobile || '',
+          danger: (p.dangerSigns || []).length > 0,
+        })),
+      });
+    }
+    clusters.sort((a, b) => b.last7 - a.last7);
+
+    const bySyn = new Map();
+    for (const r of recent) {
+      bySyn.set(r.syndrome, (bySyn.get(r.syndrome) || 0) + 1);
+    }
+
+    res.json({
+      success: true,
+      data: {
+        clusters,
+        bySyndrome: [...bySyn.entries()].map(([syndrome, count]) => ({ syndrome, count }))
+          .sort((a, b) => b.count - a.count),
+        totals: {
+          last7: recent.length,
+          prev21: rows.length - recent.length,
+          malariaPositive: recent.filter(r => r.rdtMalaria === 'positive').length,
+          dengueSuspect: recent.filter(r => r.dengueSuspect === true).length,
+          referred: recent.filter(r => r.referred === true).length,
+        },
+        recent: recent.slice(0, 50).map(r => ({
+          name: r.personName || '—', syndrome: r.syndrome,
+          village: r.village || '', block: r.block || blockOf.get(String(r.ashaId)) || '',
+          onset: r.onsetDate, mobile: r.mobile || '',
+        })),
+      },
+    });
+  } catch (err) {
+    res.status(500).json({ success: false, message: err.message });
+  }
+});
+
+// ── District operations rollup ───────────────────────────────────────────────
+//
+// One call behind the Operations screen: facilities and their staffing gaps,
+// cold-chain failures, open outbreaks, inspection scores, training, meetings and
+// budget utilisation. Each block returns the ACTIONABLE subset, not a dump.
+app.get('/api/admin/operations', auth, requireSupervisor, async (req, res) => {
+  try {
+    const me = await User.findById(req.user.id).select('role isAdmin district block').lean();
+    if (!me) return res.status(404).json({ success: false, message: 'User not found' });
+    const role = effectiveRole(me);
+    const q = {};
+    if (me.district) q.district = me.district;
+    if (role !== 'cmho' && me.block) q.block = me.block;
+
+    const now = Date.now();
+    const d30 = new Date(now - 30 * 86400000);
+    const d7  = new Date(now - 7 * 86400000);
+
+    const [facilities, cold, outbreaks, inspections, trainings, meetings, budget] =
+      await Promise.all([
+        Facility.find({ ...q, isActive: { $ne: false } }).lean(),
+        ColdChain.find({ ...q, date: { $gte: d30 } }).lean(),
+        Outbreak.find({ ...q }).sort({ detectedAt: -1 }).limit(100).lean(),
+        Inspection.find({ ...q, date: { $gte: new Date(now - 180 * 86400000) } }).lean(),
+        Training.find({ ...q, date: { $gte: new Date(now - 365 * 86400000) } }).lean(),
+        Meeting.find({ ...q, date: { $gte: new Date(now - 365 * 86400000) } }).lean(),
+        Budget.find(me.district ? { district: me.district } : {}).lean(),
+      ]);
+
+    // ── Facilities + the staffing gap ──
+    const vacancies = [];
+    let sanctionedTotal = 0, inPostTotal = 0;
+    for (const f of facilities) {
+      for (const s of (f.staff || [])) {
+        sanctionedTotal += s.sanctioned || 0;
+        inPostTotal += s.inPost || 0;
+        const gap = (s.sanctioned || 0) - (s.inPost || 0);
+        if (gap > 0) {
+          vacancies.push({
+            facility: f.name, type: f.type, block: f.block || '',
+            cadre: s.cadre, sanctioned: s.sanctioned, inPost: s.inPost, gap,
+          });
+        }
+      }
+    }
+    vacancies.sort((a, b) => b.gap - a.gap);
+
+    // Facilities that cannot deliver at night — a direct Delay-3 signal.
+    const noNightDelivery = facilities
+      .filter(f => ['DH', 'SDH', 'SGH', 'BPHC', 'PHC'].includes(f.type)
+                && f.services && f.services.deliveries24x7 !== true)
+      .map(f => ({ name: f.name, type: f.type, block: f.block || '' }));
+
+    // ── Cold chain ──
+    // Out of range for an ILR is anything outside 2-8 C. A single excursion can
+    // spoil an entire block's vaccine stock, so this is reported by name.
+    const coldFail = cold.filter(c =>
+      c.working === false ||
+      (c.tempAm !== null && c.tempAm !== undefined && (c.tempAm < 2 || c.tempAm > 8)) ||
+      (c.tempPm !== null && c.tempPm !== undefined && (c.tempPm < 2 || c.tempPm > 8)) ||
+      (c.powerCutHours || 0) >= 4);
+    const ilrPoints = facilities.filter(f => f.services && f.services.ilr === true);
+    const reportedIds = new Set(cold.filter(c => new Date(c.date) >= d7).map(c => String(c.facilityId)));
+    // Silence from a cold-chain point is not "the fridge is fine".
+    const coldSilent = ilrPoints
+      .filter(f => !reportedIds.has(String(f._id)))
+      .map(f => ({ name: f.name, block: f.block || '', type: f.type }));
+
+    // ── Inspections ──
+    const inspected = new Set(inspections.map(i => String(i.facilityId)));
+    const neverInspected = facilities
+      .filter(f => !inspected.has(String(f._id)))
+      .map(f => ({ name: f.name, type: f.type, block: f.block || '' }));
+    const lowScore = inspections
+      .filter(i => i.score !== null && i.score !== undefined && i.score < 70)
+      .sort((a, b) => (a.score || 0) - (b.score || 0))
+      .slice(0, 20)
+      .map(i => ({ facility: i.facilityName, score: i.score, date: i.date, block: i.block || '' }));
+
+    // ── Meetings: open action items, which is the only part that changes anything
+    const openActions = [];
+    for (const m of meetings) {
+      for (const a of (m.actionItems || [])) {
+        if (a.done === true) continue;
+        openActions.push({
+          what: a.what, who: a.who, byDate: a.byDate,
+          meeting: m.title, kind: m.kind,
+          overdue: a.byDate ? new Date(a.byDate).getTime() < now : false,
+        });
+      }
+    }
+    openActions.sort((a, b) => (b.overdue ? 1 : 0) - (a.overdue ? 1 : 0));
+
+    // ── Budget utilisation ──
+    const fy = budget.reduce((acc, b) => {
+      acc.allocated += b.allocated || 0;
+      acc.spent += b.spent || 0;
+      acc.committed += b.committed || 0;
+      return acc;
+    }, { allocated: 0, spent: 0, committed: 0 });
+    const pct = (n, d) => (d > 0 ? Math.round((n / d) * 1000) / 10 : null);
+
+    res.json({
+      success: true,
+      data: {
+        facilities: {
+          total: facilities.length,
+          byType: [...facilities.reduce((m, f) => m.set(f.type, (m.get(f.type) || 0) + 1), new Map())]
+            .map(([type, count]) => ({ type, count })),
+          list: facilities.map(f => ({
+            id: String(f._id), name: f.name, type: f.type, block: f.block || '',
+            incharge: f.incharge || '', mobile: f.mobile || '',
+            services: f.services || {},
+            staffGap: (f.staff || []).reduce((s, x) => s + Math.max(0, (x.sanctioned || 0) - (x.inPost || 0)), 0),
+          })),
+          noNightDelivery,
+        },
+        staffing: {
+          sanctioned: sanctionedTotal, inPost: inPostTotal,
+          vacant: Math.max(0, sanctionedTotal - inPostTotal),
+          fillRate: pct(inPostTotal, sanctionedTotal),
+          vacancies: vacancies.slice(0, 40),
+        },
+        coldChain: {
+          points: ilrPoints.length,
+          reported7d: reportedIds.size,
+          failures: coldFail.slice(0, 30).map(c => ({
+            facility: c.facilityName, block: c.block || '', date: c.date,
+            tempAm: c.tempAm, tempPm: c.tempPm,
+            powerCutHours: c.powerCutHours || 0, working: c.working !== false,
+            vaccineMoved: c.vaccineMoved === true,
+          })),
+          silent: coldSilent,
+        },
+        outbreaks: {
+          open: outbreaks.filter(o => o.status === 'open').map(o => ({
+            id: String(o._id), title: o.title, kind: o.kind, syndrome: o.syndrome || '',
+            village: o.village || '', block: o.block || '',
+            detectedAt: o.detectedAt, caseCount: o.caseCount || 0, deaths: o.deaths || 0,
+            actions: o.actions || {},
+            // Which standard responses have NOT been arranged yet.
+            pending: Object.entries(o.actions || {}).filter(([, v]) => v !== true).map(([k]) => k),
+          })),
+          closedCount: outbreaks.filter(o => o.status !== 'open').length,
+        },
+        inspections: {
+          count: inspections.length,
+          avgScore: inspections.length
+            ? Math.round(inspections.reduce((s, i) => s + (i.score || 0), 0) / inspections.length)
+            : null,
+          lowScore, neverInspected,
+        },
+        training: {
+          sessions: trainings.length,
+          trained: trainings.reduce((s, t) => s + (t.attendedCount || 0), 0),
+          invited: trainings.reduce((s, t) => s + (t.invited || 0), 0),
+          recent: trainings.slice(0, 10).map(t => ({
+            title: t.title, topic: t.topic || '', date: t.date,
+            attended: t.attendedCount || 0, invited: t.invited || 0,
+          })),
+        },
+        meetings: {
+          count: meetings.length,
+          openActions: openActions.slice(0, 40),
+          overdueActions: openActions.filter(a => a.overdue).length,
+          recent: meetings.slice(0, 10).map(m => ({
+            title: m.title, kind: m.kind, date: m.date, attendees: m.attendees || 0,
+          })),
+        },
+        budget: {
+          ...fy,
+          utilisationPct: pct(fy.spent, fy.allocated),
+          lines: budget.map(b => ({
+            head: b.head, scheme: b.scheme || '', financialYear: b.financialYear || '',
+            allocated: b.allocated || 0, spent: b.spent || 0, committed: b.committed || 0,
+            utilisationPct: pct(b.spent || 0, b.allocated || 0),
+          })).sort((a, b) => (a.utilisationPct ?? 999) - (b.utilisationPct ?? 999)),
+        },
+      },
+    });
   } catch (err) {
     res.status(500).json({ success: false, message: err.message });
   }
