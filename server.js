@@ -2049,6 +2049,202 @@ app.post('/api/reports', auth, async (req, res) => {
   }
 });
 
+// ── National Health Programmes ───────────────────────────────────────────────
+//
+// A CMHO does not run one programme, she runs all of them. The district screen
+// answers only RCH (maternal + child), which is roughly a seventh of her actual
+// job. This endpoint covers every programme the app ALREADY collects data for —
+// nothing here requires new field collection:
+//
+//   NTEP  (TB)               TbCase        — incl. Nikshay registration + adherence
+//   NCD                      NcdCbac       — CBAC risk score, HTN/diabetes
+//   Family Planning          EligibleCouple— method adopted vs unmet need
+//   CRS (vital registration) VitalEvent    — births/deaths registered with the state
+//   Immunization             ScheduleEvent — due vs done
+//   Drug logistics           MedicineStock — lines below threshold
+//
+// NOT covered, and deliberately absent rather than faked: disease surveillance
+// (fever/diarrhoea/dengue/malaria — the triage engine has 7 RCH case types and no
+// fever pathway), leprosy, blindness, HR postings, budget, training records and
+// hospital inspection. Those need either new collection or a facility model that
+// does not exist. A panel that showed empty "Malaria" tiles would imply zero
+// cases in a district that has simply never been asked.
+//
+// Every programme returns NAMED, actionable rows — not just counts. A CMHO acts
+// on "Rahim Sheikh, 4 doses missed, Kolkata", never on "adherence 87%".
+app.get('/api/admin/programmes', auth, requireSupervisor, async (req, res) => {
+  try {
+    const months = Math.max(1, Math.min(24, Number(req.query.months) || 12));
+    const since = new Date();
+    since.setMonth(since.getMonth() - months);
+
+    const ashaIds = await subtreeAshaIds(req.user);
+    if (!ashaIds.length) {
+      return res.json({ success: true, data: { periodMonths: months, programmes: [] } });
+    }
+    const ashaDocs = await User.find({ _id: { $in: ashaIds } })
+      .select('_id name block').lean();
+    const blockOf = new Map(ashaDocs.map(a => [String(a._id), a.block || 'অজানা']));
+    const A = { ashaId: { $in: ashaIds } };
+    const W = { ...A, createdAt: { $gte: since } };
+
+    const [tb, ncd, fp, vitals, stock] = await Promise.all([
+      TbCase.find(A).select('ashaId personName village stage testResult tbType treatmentStart dosesTaken dosesMissed nikshayId outcome followUpDate mobile createdAt').lean(),
+      NcdCbac.find(W).select('ashaId personName village age sex riskScore knownHtn knownDiabetes bp bloodSugar referred referredTo followUpDate mobile').lean(),
+      EligibleCouple.find(A).select('ashaId wifeName husbandName village fpMethod fpAdoptedDate sons daughters youngestChildAge highRisk mobile').lean(),
+      VitalEvent.find(W).select('ashaId eventType personName village eventDate registered registrationNo maternalDeath infantDeath causeOfDeath mobile').lean(),
+      MedicineStock.find({ ...A, lowStockThreshold: { $gt: 0 }, $expr: { $lte: ['$closingStock', '$lowStockThreshold'] } })
+        .select('ashaId medicineName closingStock lowStockThreshold').lean(),
+    ]);
+
+    const pct = (n, d) => (d > 0 ? Math.round((n / d) * 1000) / 10 : null);
+    const blk = (r) => blockOf.get(String(r.ashaId)) || 'অজানা';
+    const num = (v) => { const n = parseInt(String(v ?? '').replace(/[^0-9]/g, ''), 10); return Number.isFinite(n) ? n : 0; };
+    // Per-block tallies so each programme can be seen geographically, using the
+    // same district -> block drill the rest of the panel uses.
+    const byBlock = (rows, hit) => {
+      const m = new Map();
+      for (const r of rows) {
+        const b = blk(r);
+        if (!m.has(b)) m.set(b, { block: b, total: 0, flagged: 0 });
+        const e = m.get(b);
+        e.total++;
+        if (hit(r)) e.flagged++;
+      }
+      return [...m.values()].sort((x, y) => y.flagged - x.flagged);
+    };
+
+    // ── NTEP ──────────────────────────────────────────────────────────────────
+    // Two things kill a TB programme: patients who interrupt treatment (drug
+    // resistance), and patients never entered in Nikshay (invisible to the state,
+    // and their drugs are not requisitioned).
+    const tbOn = tb.filter(t => t.stage === 'on_treatment');
+    const tbPresumptive = tb.filter(t => t.stage === 'presumptive');
+    const tbMissed = tbOn.filter(t => num(t.dosesMissed) > 0)
+      .sort((a, b) => num(b.dosesMissed) - num(a.dosesMissed));
+    const tbNoNikshay = tbOn.filter(t => !String(t.nikshayId || '').trim());
+    const tbAwaitingResult = tbPresumptive.filter(t => !String(t.testResult || '').trim());
+
+    // ── NCD ───────────────────────────────────────────────────────────────────
+    // CBAC score >= 4 is the national threshold for "needs confirmatory screening".
+    const ncdHigh = ncd.filter(n => (n.riskScore || 0) >= 4);
+    const ncdReferredNoFollow = ncd.filter(n => n.referred === true && !n.followUpDate);
+
+    // ── Family Planning ───────────────────────────────────────────────────────
+    // Unmet need — an eligible couple using no method — is THE family-planning
+    // indicator, and the one an ASHA can actually change with a home visit.
+    const fpAdopted = fp.filter(c => String(c.fpMethod || '').trim() && c.fpMethod !== 'none');
+    const fpUnmet = fp.filter(c => !String(c.fpMethod || '').trim() || c.fpMethod === 'none');
+    // Highest priority: no method AND a baby under one — the next pregnancy is
+    // already the highest-risk kind (short birth interval).
+    const fpUrgent = fpUnmet.filter(c => c.highRisk === true || num(c.youngestChildAge) <= 1);
+
+    // ── CRS ───────────────────────────────────────────────────────────────────
+    // An unregistered birth is a child with no legal identity; an unregistered
+    // death breaks the district's mortality reporting to the state.
+    const births = vitals.filter(v => v.eventType === 'birth');
+    const deaths = vitals.filter(v => v.eventType === 'death');
+    const unregistered = vitals.filter(v => v.registered !== true);
+    const deathsToReview = deaths.filter(v => v.maternalDeath === true || v.infantDeath === true);
+
+    const row = (r, label, sub) => ({
+      name: label, detail: sub, village: r.village || '',
+      block: blk(r), mobile: r.mobile || '',
+    });
+
+    res.json({
+      success: true,
+      data: {
+        periodMonths: months,
+        programmes: [
+          {
+            key: 'ntep', name: 'যক্ষ্মা (NTEP)', icon: 'tb',
+            headline: [
+              { label: 'চিকিৎসাধীন', value: tbOn.length },
+              { label: 'সন্দেহভাজন', value: tbPresumptive.length },
+              { label: 'ডোজ বাদ পড়েছে', value: tbMissed.length, alarm: tbMissed.length > 0 },
+              { label: 'Nikshay-এ নেই', value: tbNoNikshay.length, alarm: tbNoNikshay.length > 0 },
+            ],
+            actions: [
+              { title: 'ডোজ বাদ পড়েছে — চিকিৎসা ভেঙে যাচ্ছে', severity: 'high',
+                rows: tbMissed.slice(0, 20).map(t => row(t, t.personName || '—', `${num(t.dosesMissed)} ডোজ বাদ`)) },
+              { title: 'Nikshay ID নেই — রাজ্যের হিসাবে নেই', severity: 'high',
+                rows: tbNoNikshay.slice(0, 20).map(t => row(t, t.personName || '—', t.tbType || 'TB')) },
+              { title: 'কফ পরীক্ষার ফল আসেনি', severity: 'medium',
+                rows: tbAwaitingResult.slice(0, 20).map(t => row(t, t.personName || '—', 'ফল বাকি')) },
+            ],
+            blocks: byBlock(tb, t => t.stage === 'on_treatment' && num(t.dosesMissed) > 0),
+          },
+          {
+            key: 'ncd', name: 'NCD স্ক্রিনিং', icon: 'ncd',
+            headline: [
+              { label: 'স্ক্রিন করা হয়েছে', value: ncd.length },
+              { label: 'উচ্চ ঝুঁকি (CBAC ≥ 4)', value: ncdHigh.length, alarm: ncdHigh.length > 0 },
+              { label: 'জানা ডায়াবেটিস', value: ncd.filter(n => n.knownDiabetes).length },
+              { label: 'জানা উচ্চ রক্তচাপ', value: ncd.filter(n => n.knownHtn).length },
+            ],
+            actions: [
+              { title: 'উচ্চ ঝুঁকি — নিশ্চিত পরীক্ষা দরকার', severity: 'high',
+                rows: ncdHigh.slice(0, 20).map(n => row(n, n.personName || '—', `CBAC ${n.riskScore || 0}${n.bp ? ' · BP ' + n.bp : ''}`)) },
+              { title: 'রেফার হয়েছে, ফলো-আপ তারিখ নেই', severity: 'medium',
+                rows: ncdReferredNoFollow.slice(0, 20).map(n => row(n, n.personName || '—', n.referredTo || 'রেফার')) },
+            ],
+            blocks: byBlock(ncd, n => (n.riskScore || 0) >= 4),
+          },
+          {
+            key: 'fp', name: 'পরিবার পরিকল্পনা', icon: 'fp',
+            headline: [
+              { label: 'যোগ্য দম্পতি', value: fp.length },
+              { label: 'পদ্ধতি নিয়েছেন', value: fpAdopted.length },
+              { label: 'পদ্ধতি নেননি', value: fpUnmet.length, alarm: fpUnmet.length > 0 },
+              { label: 'কভারেজ', value: pct(fpAdopted.length, fp.length), suffix: '%' },
+            ],
+            actions: [
+              { title: 'পদ্ধতি নেই + ছোট বাচ্চা — এখনই কাউন্সেলিং', severity: 'high',
+                rows: fpUrgent.slice(0, 20).map(c => row(c, c.wifeName || '—', `${num(c.sons) + num(c.daughters)} সন্তান · ছোট ${c.youngestChildAge || '?'} বছর`)) },
+              { title: 'কোনও পদ্ধতি নেননি', severity: 'medium',
+                rows: fpUnmet.slice(0, 20).map(c => row(c, c.wifeName || '—', `${num(c.sons) + num(c.daughters)} সন্তান`)) },
+            ],
+            blocks: byBlock(fp, c => !String(c.fpMethod || '').trim() || c.fpMethod === 'none'),
+          },
+          {
+            key: 'crs', name: 'জন্ম-মৃত্যু নিবন্ধন (CRS)', icon: 'crs',
+            headline: [
+              { label: 'জন্ম', value: births.length },
+              { label: 'মৃত্যু', value: deaths.length },
+              { label: 'নিবন্ধন বাকি', value: unregistered.length, alarm: unregistered.length > 0 },
+              { label: 'নিবন্ধিত', value: pct(vitals.length - unregistered.length, vitals.length), suffix: '%' },
+            ],
+            actions: [
+              { title: 'ডেথ রিভিউ দরকার (MDSR / CDR)', severity: 'high',
+                rows: deathsToReview.slice(0, 20).map(v => row(v, v.personName || '—', v.maternalDeath ? 'মাতৃমৃত্যু' : 'শিশুমৃত্যু')) },
+              { title: 'CRS-এ নিবন্ধন হয়নি', severity: 'medium',
+                rows: unregistered.slice(0, 20).map(v => row(v, v.personName || '—', v.eventType === 'birth' ? 'জন্ম' : 'মৃত্যু')) },
+            ],
+            blocks: byBlock(vitals, v => v.registered !== true),
+          },
+          {
+            key: 'drug', name: 'ওষুধ ও সরবরাহ', icon: 'drug',
+            headline: [
+              { label: 'কম স্টক লাইন', value: stock.length, alarm: stock.length > 0 },
+            ],
+            actions: [
+              { title: 'থ্রেশহোল্ডের নিচে', severity: stock.length ? 'medium' : 'none',
+                rows: stock.slice(0, 20).map(s => row(s, s.medicineName || '—', `${s.closingStock} বাকি (সীমা ${s.lowStockThreshold})`)) },
+            ],
+            blocks: byBlock(stock, () => true),
+            // The live readiness pulse is the real supply signal; this is the
+            // monthly ledger. Point the UI at the better one.
+            seeAlso: 'readiness',
+          },
+        ],
+      },
+    });
+  } catch (err) {
+    res.status(500).json({ success: false, message: err.message });
+  }
+});
+
 // ── Readiness pulse (supply / equipment / transport) ──────────────────────────
 
 // The items THIS user is asked about. Role-scoped so an ASHA gets an 8-item,
